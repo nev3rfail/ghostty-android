@@ -66,6 +66,7 @@ class GhosttyRenderer(
     private external fun nativeSetTerminalSize(cols: Int, rows: Int)
     private external fun nativeSetFontSize(fontSize: Int)
     private external fun nativeProcessInput(ansiSequence: String)
+    private external fun nativeProcessInputBytes(bytes: ByteArray, length: Int)
 
     // Scrolling native methods
     private external fun nativeGetScrollbackRows(): Int
@@ -340,6 +341,24 @@ class GhosttyRenderer(
             nativeProcessInput(ansiSequence)
         } catch (e: Exception) {
             Log.e(TAG, "Error in nativeProcessInput", e)
+        }
+    }
+
+    /**
+     * Process raw output from the terminal process.
+     *
+     * Terminal output is a byte stream, so it is passed through unchanged rather
+     * than decoded to a String: a read can end part-way through a multi-byte
+     * sequence, and not every byte a program emits is valid UTF-8.
+     *
+     * @param bytes Buffer holding the output
+     * @param length Number of valid bytes at the start of the buffer
+     */
+    fun processInput(bytes: ByteArray, length: Int) {
+        try {
+            nativeProcessInputBytes(bytes, length)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in nativeProcessInputBytes", e)
         }
     }
 

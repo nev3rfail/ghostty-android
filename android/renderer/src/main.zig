@@ -553,6 +553,61 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeProcessInput(
     }
 }
 
+/// Feed raw bytes produced by the terminal process.
+///
+/// Terminal output is a byte stream. Routing it through a Java String corrupts
+/// any multi-byte sequence that straddles a read boundary, and cannot carry
+/// bytes that are not valid UTF-8 at all, so process output takes this path
+/// instead of nativeProcessInput.
+///
+/// Java signature: void nativeProcessInputBytes(byte[] bytes, int length)
+export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeProcessInputBytes(
+    env: *c.JNIEnv,
+    obj: c.jobject,
+    bytes: c.jbyteArray,
+    length: c.jint,
+) void {
+    const handle = getNativeHandle(env, obj);
+
+    if (handle == 0) {
+        log.warn("No native handle set", .{});
+        return;
+    }
+
+    const state = getRendererState(handle) orelse {
+        log.warn("No renderer state for handle {d}", .{handle});
+        return;
+    };
+
+    if (!state.initialized) {
+        log.warn("Attempted to process input before renderer initialized", .{});
+        return;
+    }
+
+    if (length <= 0) return;
+
+    if (state.renderer) |*renderer| {
+        const env_vtable = env.*.?;
+
+        // JNI_ABORT on release: the terminal only reads these bytes, so there is
+        // nothing to copy back.
+        const elements = env_vtable.*.GetByteArrayElements.?(env, bytes, null) orelse {
+            log.err("Failed to access input byte array", .{});
+            return;
+        };
+        defer env_vtable.*.ReleaseByteArrayElements.?(env, bytes, elements, c.JNI_ABORT);
+
+        const data = @as([*]const u8, @ptrCast(elements))[0..@intCast(length)];
+
+        renderer.processInput(data) catch |err| {
+            log.err("Failed to process input: {}", .{err});
+            return;
+        };
+    } else {
+        log.warn("Renderer not initialized", .{});
+    }
+}
+
 // ============================================================================
 // Scrolling JNI Methods
 // ============================================================================
