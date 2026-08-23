@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.ghostty.android"
     compileSdk = 35
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         minSdk = 24
@@ -40,6 +41,15 @@ android {
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
+        }
+    }
+
+    // The pty support library. The renderer's own libraries are prebuilt with
+    // Zig and picked up from jniLibs instead.
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 
