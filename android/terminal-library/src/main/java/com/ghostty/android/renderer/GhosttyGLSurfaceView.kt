@@ -1134,12 +1134,34 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     // Keyboard input
     // ========================================================================
 
+    /**
+     * Apply Control to the next character the user types.
+     *
+     * A soft keyboard has no Control key, so a host offers one as a sticky
+     * modifier: set this, and the next committed character is folded to its
+     * control code.
+     */
+    var ctrlPending: Boolean = false
+
+    /** Apply Alt to the next character typed, sending it with a meta prefix. */
+    var altPending: Boolean = false
+
+    /**
+     * Called once a sticky modifier has been consumed, so a host can drop
+     * whatever it shows for it.
+     */
+    var onModifiersConsumed: (() -> Unit)? = null
+
     override fun onCheckIsTextEditor(): Boolean = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
         // TYPE_NULL stops the IME from keeping an editable buffer. A terminal has
         // no text field to edit, only a byte stream to feed, and a buffer the IME
         // can re-send is what makes keystrokes arrive twice.
+        // Logged because a repeated restart here is what an IME storm looks like:
+        // it should happen once per focus change, not continuously.
+        Log.d(TAG, "onCreateInputConnection")
+
         outAttrs.inputType = EditorInfo.TYPE_NULL
         outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI or
@@ -1158,6 +1180,47 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
         val encoded = encodeKey(keyCode, event) ?: return super.onKeyDown(keyCode, event)
         eventListener?.onInput(encoded)
         return true
+    }
+
+    /**
+     * Encode committed text, consuming any sticky modifier that is set.
+     */
+    private fun encodeCommitted(text: String): ByteArray {
+        var bytes = text.toByteArray(Charsets.UTF_8)
+        var consumed = false
+
+        if (ctrlPending) {
+            ctrlPending = false
+            consumed = true
+            val control = text.firstOrNull()?.let { controlByte(it) }
+            if (control != null) {
+                bytes = byteArrayOf(control) + text.substring(1).toByteArray(Charsets.UTF_8)
+            }
+        }
+
+        if (altPending) {
+            altPending = false
+            consumed = true
+            bytes = byteArrayOf(ESC) + bytes
+        }
+
+        if (consumed) onModifiersConsumed?.invoke()
+        return bytes
+    }
+
+    /** The C0 code a character maps to when Control is held, if any. */
+    private fun controlByte(character: Char): Byte? {
+        val lowered = character.code or 0x20
+        if (lowered in 0x61..0x7A) return (lowered - 0x60).toByte()
+
+        return when (character.code) {
+            0x5B -> 0x1B // [
+            0x5C -> 0x1C // backslash
+            0x5D -> 0x1D // ]
+            0x3F -> DEL // ?
+            0x20 -> 0x00 // space
+            else -> null
+        }
     }
 
     /**
@@ -1182,17 +1245,26 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
         val codePoint = event.unicodeChar
         if (codePoint == 0) return null
 
-        // Control folds a letter down to the matching C0 code.
-        if (event.isCtrlPressed) {
-            val lowered = codePoint or 0x20
-            if (lowered < 0x61 || lowered > 0x7A) return null
-            return byteArrayOf((lowered - 0x60).toByte())
+        // A sticky modifier counts the same as one held on a keyboard, and is
+        // spent whether or not the key it lands on has a control code.
+        val ctrl = event.isCtrlPressed || ctrlPending
+        val alt = event.isAltPressed || altPending
+        if (ctrlPending || altPending) {
+            ctrlPending = false
+            altPending = false
+            onModifiersConsumed?.invoke()
+        }
+
+        // Control folds a character down to the matching C0 code.
+        if (ctrl) {
+            val control = controlByte(codePoint.toChar()) ?: return null
+            return if (alt) byteArrayOf(ESC, control) else byteArrayOf(control)
         }
 
         val typed = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8)
 
         // Alt is the conventional stand-in for a meta prefix.
-        return if (event.isAltPressed) byteArrayOf(ESC) + typed else typed
+        return if (alt) byteArrayOf(ESC) + typed else typed
     }
 
     /**
@@ -1208,7 +1280,7 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
                 // A terminal expects carriage return where a text field would
                 // carry a line feed.
                 val forTerminal = value.replace(LINE_FEED_CHAR, CARRIAGE_RETURN_CHAR)
-                eventListener?.onInput(forTerminal.toByteArray(Charsets.UTF_8))
+                eventListener?.onInput(encodeCommitted(forTerminal))
             }
             return true
         }

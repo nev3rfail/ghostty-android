@@ -105,12 +105,26 @@ fun TerminalScreen(
     onGLSurfaceViewCreated: (GhosttyGLSurfaceView) -> Unit,
 ) {
     var surfaceView by remember { mutableStateOf<GhosttyGLSurfaceView?>(null) }
+    var ctrlActive by remember { mutableStateOf(false) }
+    var altActive by remember { mutableStateOf(false) }
 
+    // Without this the soft keyboard covers the toolbar.
     Scaffold(
+        modifier = Modifier.imePadding(),
         bottomBar = {
             InputToolbar(
                 onKeyPress = { session.write(it) },
                 onShowKeyboard = { surfaceView?.showKeyboard() },
+                onToggleCtrl = {
+                    ctrlActive = !ctrlActive
+                    surfaceView?.ctrlPending = ctrlActive
+                },
+                onToggleAlt = {
+                    altActive = !altActive
+                    surfaceView?.altPending = altActive
+                },
+                ctrlActive = ctrlActive,
+                altActive = altActive,
             )
         }
     ) { paddingValues ->
@@ -119,6 +133,11 @@ fun TerminalScreen(
                 GhosttyGLSurfaceView(context).also { view ->
                     surfaceView = view
                     onGLSurfaceViewCreated(view)
+
+                    view.onModifiersConsumed = {
+                        ctrlActive = false
+                        altActive = false
+                    }
 
                     view.setEventListener(object : TerminalEventListener {
                         override fun onSurfaceReady(cols: Int, rows: Int) {

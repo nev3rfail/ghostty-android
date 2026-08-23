@@ -17,6 +17,10 @@ import androidx.compose.ui.unit.dp
 fun InputToolbar(
     onKeyPress: (String) -> Unit,
     onShowKeyboard: () -> Unit,
+    onToggleCtrl: () -> Unit = {},
+    onToggleAlt: () -> Unit = {},
+    ctrlActive: Boolean = false,
+    altActive: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -37,8 +41,10 @@ fun InputToolbar(
             ) {
                 ToolbarButton("ESC", onClick = { onKeyPress("\u001B") })
                 ToolbarButton("TAB", onClick = { onKeyPress("\t") })
-                ToolbarButton("CTRL", onClick = { /* TODO: Implement modifier state */ })
-                ToolbarButton("ALT", onClick = { /* TODO: Implement modifier state */ })
+                // Control and Alt are sticky: a soft keyboard has no such keys,
+                // so they apply to the next character typed.
+                ToolbarButton("CTRL", onClick = onToggleCtrl, active = ctrlActive)
+                ToolbarButton("ALT", onClick = onToggleAlt, active = altActive)
                 ToolbarButton("↑", onClick = { onKeyPress("\u001B[A") })
                 ToolbarButton("↓", onClick = { onKeyPress("\u001B[B") })
             }
@@ -61,16 +67,20 @@ fun InputToolbar(
 private fun ToolbarButton(
     text: String,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    active: Boolean = false
 ) {
-    OutlinedButton(
-        onClick = onClick,
-        modifier = modifier.height(36.dp),
-        contentPadding = PaddingValues(horizontal = 8.dp)
-    ) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.labelSmall
-        )
+    val height = modifier.height(36.dp)
+    val padding = PaddingValues(horizontal = 8.dp)
+
+    // A sticky modifier that is armed has to look different from one that is not.
+    if (active) {
+        Button(onClick = onClick, modifier = height, contentPadding = padding) {
+            Text(text = text, style = MaterialTheme.typography.labelSmall)
+        }
+    } else {
+        OutlinedButton(onClick = onClick, modifier = height, contentPadding = padding) {
+            Text(text = text, style = MaterialTheme.typography.labelSmall)
+        }
     }
 }
