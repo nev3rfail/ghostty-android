@@ -14,10 +14,15 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.Choreographer
 import android.view.GestureDetector
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PixelCopy
 import android.view.VelocityTracker
 import android.view.ViewConfiguration
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.EdgeEffect
 import android.widget.OverScroller
@@ -57,6 +62,14 @@ interface TerminalEventListener {
      * @param rows Terminal rows
      */
     fun onSurfaceReady(cols: Int, rows: Int)
+
+    /**
+     * Called with bytes the user typed, already encoded for a terminal.
+     *
+     * Keystrokes arrive from the soft keyboard and from hardware keys, and both
+     * are delivered here as the byte sequence a program reading the pty expects.
+     */
+    fun onInput(bytes: ByteArray) {}
 
     /**
      * Called when the GL surface has been resumed after a pause.
@@ -148,6 +161,16 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
 
     companion object {
         private const val TAG = "GhosttyGLSurfaceView"
+
+        // Control bytes, written numerically so they survive any tooling that
+        // rewrites escape sequences.
+        private const val TAB: Byte = 0x09
+        private const val CR: Byte = 0x0D
+        private const val ESC: Byte = 0x1B
+        private const val DEL: Byte = 0x7F
+        private val CSI = byteArrayOf(0x1B, 0x5B)
+        private val LINE_FEED_CHAR = 10.toChar()
+        private val CARRIAGE_RETURN_CHAR = 13.toChar()
 
         // OpenGL ES version requirements
         private const val GLES_MAJOR_VERSION = 3
@@ -371,6 +394,10 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
 
     init {
         Log.d(TAG, "Initializing Ghostty GL Surface View")
+
+        // Required for the view to take focus and receive key events.
+        isFocusable = true
+        isFocusableInTouchMode = true
 
         // Listen for system gesture insets to allow back gesture to work at screen edges
         ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
@@ -1101,6 +1128,105 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
      * - onKeyboardOverlayProgress: during keyboard gesture drag/animation
      * - onKeyboardOverlayStateChanged: when keyboard gesture state changes
      */
+    // ========================================================================
+    // Keyboard input
+    // ========================================================================
+
+    override fun onCheckIsTextEditor(): Boolean = true
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        // TYPE_NULL stops the IME from keeping an editable buffer. A terminal has
+        // no text field to edit, only a byte stream to feed, and a buffer the IME
+        // can re-send is what makes keystrokes arrive twice.
+        outAttrs.inputType = EditorInfo.TYPE_NULL
+        outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or
+            EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+            EditorInfo.IME_FLAG_NO_FULLSCREEN
+        return TerminalInputConnection()
+    }
+
+    /** Take focus and ask the system to raise the soft keyboard. */
+    fun showKeyboard() {
+        requestFocus()
+        val manager = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        manager.showSoftInput(this, 0)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val encoded = encodeKey(keyCode, event) ?: return super.onKeyDown(keyCode, event)
+        eventListener?.onInput(encoded)
+        return true
+    }
+
+    /**
+     * Translate a key press into the bytes a terminal expects, or null for keys
+     * that are not typed input and belong to the system.
+     */
+    private fun encodeKey(keyCode: Int, event: KeyEvent): ByteArray? {
+        when (keyCode) {
+            KeyEvent.KEYCODE_ENTER -> return byteArrayOf(CR)
+            KeyEvent.KEYCODE_DEL -> return byteArrayOf(DEL)
+            KeyEvent.KEYCODE_TAB -> return byteArrayOf(TAB)
+            KeyEvent.KEYCODE_ESCAPE -> return byteArrayOf(ESC)
+            KeyEvent.KEYCODE_DPAD_UP -> return CSI + 0x41.toByte()
+            KeyEvent.KEYCODE_DPAD_DOWN -> return CSI + 0x42.toByte()
+            KeyEvent.KEYCODE_DPAD_RIGHT -> return CSI + 0x43.toByte()
+            KeyEvent.KEYCODE_DPAD_LEFT -> return CSI + 0x44.toByte()
+            KeyEvent.KEYCODE_MOVE_END -> return CSI + 0x46.toByte()
+            KeyEvent.KEYCODE_MOVE_HOME -> return CSI + 0x48.toByte()
+            KeyEvent.KEYCODE_FORWARD_DEL -> return CSI + 0x33.toByte() + 0x7E.toByte()
+        }
+
+        val codePoint = event.unicodeChar
+        if (codePoint == 0) return null
+
+        // Control folds a letter down to the matching C0 code.
+        if (event.isCtrlPressed) {
+            val lowered = codePoint or 0x20
+            if (lowered < 0x61 || lowered > 0x7A) return null
+            return byteArrayOf((lowered - 0x60).toByte())
+        }
+
+        val typed = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8)
+
+        // Alt is the conventional stand-in for a meta prefix.
+        return if (event.isAltPressed) byteArrayOf(ESC) + typed else typed
+    }
+
+    /**
+     * Feeds IME text straight to the terminal. BaseInputConnection supplies the
+     * plumbing only; nothing is buffered behind it, so every commit is final.
+     */
+    private inner class TerminalInputConnection :
+        BaseInputConnection(this@GhosttyGLSurfaceView, false) {
+
+        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            val value = text?.toString() ?: return true
+            if (value.isNotEmpty()) {
+                // A terminal expects carriage return where a text field would
+                // carry a line feed.
+                val forTerminal = value.replace(LINE_FEED_CHAR, CARRIAGE_RETURN_CHAR)
+                eventListener?.onInput(forTerminal.toByteArray(Charsets.UTF_8))
+            }
+            return true
+        }
+
+        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            // There is nowhere to show a composition, so wait for the commit.
+            return true
+        }
+
+        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+            repeat(beforeLength) { eventListener?.onInput(byteArrayOf(DEL)) }
+            return true
+        }
+
+        override fun sendKeyEvent(event: KeyEvent): Boolean {
+            if (event.action == KeyEvent.ACTION_DOWN) return onKeyDown(event.keyCode, event)
+            return true
+        }
+    }
+
     fun setEventListener(listener: TerminalEventListener?) {
         this.eventListener = listener
     }
