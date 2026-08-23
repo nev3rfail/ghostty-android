@@ -28,8 +28,8 @@ void main() {
 
     // Unpack Android ARGB color (0xAARRGGBB format)
     // unpack4u8 returns bytes in order: [B, G, R, A] due to little-endian
-    uvec4 packed = unpack4u8(tint_color_packed_4u8);
-    uvec4 argb_to_rgba = uvec4(packed.z, packed.y, packed.x, packed.w); // R, G, B, A
+    uvec4 packed_bytes = unpack4u8(tint_color_packed_4u8);
+    uvec4 argb_to_rgba = uvec4(packed_bytes.z, packed_bytes.y, packed_bytes.x, packed_bytes.w); // R, G, B, A
 
     // Normalize to 0.0-1.0 range
     vec4 tintColor = vec4(argb_to_rgba) / 255.0;
