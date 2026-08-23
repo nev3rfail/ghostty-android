@@ -12,7 +12,7 @@ android {
     defaultConfig {
         applicationId = "com.ghostty.android"
         minSdk = 24
-        targetSdk = 35
+        targetSdk = 28
         versionCode = 1
         versionName = "0.1.0"
 
@@ -56,6 +56,13 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            // Unpack the native libraries into the install directory. Mapping
+            // them straight out of the APK leaves that directory empty, and the
+            // syscall shim there is a program the app has to execute, not a
+            // library it loads.
+            useLegacyPackaging = true
         }
     }
 
