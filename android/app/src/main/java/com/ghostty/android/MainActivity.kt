@@ -12,7 +12,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.viewinterop.AndroidView
 import com.ghostty.android.renderer.TerminalEventListener
 import com.ghostty.android.renderer.GhosttyGLSurfaceView
@@ -25,7 +24,6 @@ import com.ghostty.android.ui.theme.GhosttyTheme
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var ghosttyBridge: GhosttyBridge
     private lateinit var terminalSession: TerminalSession
     private var glSurfaceView: GhosttyGLSurfaceView? = null
 
@@ -35,42 +33,44 @@ class MainActivity : ComponentActivity() {
         // Keep screen on while terminal is active
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Initialize Ghostty bridge
-        ghosttyBridge = GhosttyBridge.getInstance()
-        // TODO: Enable when JNI key encoder is implemented
-        // ghosttyBridge.createKeyEncoder()
-        // Create terminal session
-        terminalSession = TerminalSession()
-        // TestRunner will be created when GL surface view is initialized
-        var testId = intent.getStringExtra("TEST_ID")
-        if (testId == null) {
-            testId = "basic_colors_fg"
-        }
+        terminalSession = TerminalSession(
+            environment = TerminalSession.defaultEnvironment(
+                home = filesDir.absolutePath,
+                tmp = cacheDir.absolutePath,
+            ),
+            cwd = filesDir.absolutePath,
+        )
 
-        android.util.Log.i("MainActivity", "onCreate: testId=$testId")
+        // A test id switches the app into the visual regression harness; without
+        // one it is a terminal.
+        val testId = intent.getStringExtra("TEST_ID")
 
         enableEdgeToEdge()
 
         setContent {
-            // Use remember and mutableStateOf so the Composable recomposes when testRunner is initialized
-            val testRunnerState = remember { mutableStateOf<TestRunner?>(null) }
-
             GhosttyTheme {
+                if (testId != null) {
+                    val testRunnerState = remember { mutableStateOf<TestRunner?>(null) }
                     TestModeScreen(
                         testRunner = testRunnerState.value,
                         onExitTestMode = {},
                         onGLSurfaceViewCreated = { view ->
                             glSurfaceView = view
-                            // Initialize test runner with the renderer from the GL surface view
                             if (testRunnerState.value == null) {
                                 testRunnerState.value = TestRunner(view.getRenderer(), applicationContext)
                             }
                         },
                         testId = testId,
                     )
+                } else {
+                    TerminalScreen(
+                        session = terminalSession,
+                        onGLSurfaceViewCreated = { view -> glSurfaceView = view },
+                    )
                 }
             }
         }
+    }
 
     override fun onPause() {
         super.onPause()
@@ -87,58 +87,73 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         terminalSession.stop()
-        ghosttyBridge.cleanup()
     }
 }
 
+/**
+ * A terminal driven by [session].
+ *
+ * The renderer decides how many cells fit on screen, so the session is started
+ * from [TerminalEventListener.onSurfaceReady] with the grid size it reports and
+ * resized whenever that changes. Keystrokes arrive already encoded through
+ * [TerminalEventListener.onInput].
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TerminalScreen(
     session: TerminalSession,
-    onKeyPress: (String) -> Unit,
-    onEnterTestMode: () -> Unit,
-    onGLSurfaceViewCreated: (GhosttyGLSurfaceView) -> Unit
+    onGLSurfaceViewCreated: (GhosttyGLSurfaceView) -> Unit,
 ) {
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val focusManager = LocalFocusManager.current
+    var surfaceView by remember { mutableStateOf<GhosttyGLSurfaceView?>(null) }
 
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Ghostty Terminal") },
-                actions = {
-                    // Test mode toggle button (debug only)
-                    IconButton(onClick = onEnterTestMode) {
-                        Text("TEST", style = MaterialTheme.typography.labelSmall)
-                    }
-                }
-            )
-        },
         bottomBar = {
             InputToolbar(
-                onKeyPress = onKeyPress,
-                onShowKeyboard = {
-                    keyboardController?.show()
-                }
+                onKeyPress = { session.write(it) },
+                onShowKeyboard = { surfaceView?.showKeyboard() },
             )
         }
     ) { paddingValues ->
-        // Use AndroidView to embed the native OpenGL surface view
         AndroidView(
             factory = { context ->
                 GhosttyGLSurfaceView(context).also { view ->
-                    // Notify the activity that the view has been created
+                    surfaceView = view
                     onGLSurfaceViewCreated(view)
 
-                    // Set up terminal size (will be calculated based on view size)
-                    // For now, use default terminal size
-                    view.setTerminalSize(80, 24)
+                    view.setEventListener(object : TerminalEventListener {
+                        override fun onSurfaceReady(cols: Int, rows: Int) {
+                            if (session.isRunning.value) {
+                                session.resize(cols, rows)
+                                return
+                            }
+                            session.start(
+                                cols = cols,
+                                rows = rows,
+                                // Called on the reader thread. The terminal takes
+                                // its own lock and the surface redraws
+                                // continuously, so the bytes go straight in.
+                                onOutput = { bytes, length ->
+                                    view.getRenderer().processInput(bytes, length)
+                                },
+                            )
+                        }
+
+                        override fun onInput(bytes: ByteArray) = session.write(bytes)
+
+                        override fun onKeyboardOverlayProgress(offset: Float, maxOffset: Float) {}
+
+                        override fun onKeyboardOverlayStateChanged(expanded: Boolean) {}
+                    })
                 }
             },
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues)
+                .padding(paddingValues),
         )
+    }
+
+    LaunchedEffect(surfaceView) {
+        surfaceView?.showKeyboard()
     }
 }
 
