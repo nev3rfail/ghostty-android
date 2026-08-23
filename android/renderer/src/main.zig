@@ -608,6 +608,25 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeProcessInputBy
     }
 }
 
+/// Report whether an animation still needs frames.
+///
+/// Java signature: boolean nativeHasActiveAnimation()
+export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeHasActiveAnimation(
+    env: *c.JNIEnv,
+    obj: c.jobject,
+) c.jboolean {
+    const handle = getNativeHandle(env, obj);
+    if (handle == 0) return c.JNI_FALSE;
+
+    const state = getRendererState(handle) orelse return c.JNI_FALSE;
+    if (!state.initialized) return c.JNI_FALSE;
+
+    if (state.renderer) |*renderer| {
+        return if (renderer.hasActiveAnimation()) c.JNI_TRUE else c.JNI_FALSE;
+    }
+    return c.JNI_FALSE;
+}
+
 // ============================================================================
 // Scrolling JNI Methods
 // ============================================================================

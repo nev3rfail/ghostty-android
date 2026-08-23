@@ -690,6 +690,17 @@ fn updateAnimations(self: *Self, now: i64) void {
     }
 }
 
+/// Whether a time-based animation still needs frames drawn.
+///
+/// Ripple, sweep and the mic pulse advance from elapsed time inside render(),
+/// so a host that only draws on demand has to keep asking for frames until they
+/// finish.
+pub fn hasActiveAnimation(self: *const Self) bool {
+    return self.ripple_start_time_ns > 0 or
+        self.sweep_start_time_ns > 0 or
+        self.mic_indicator_state != .off;
+}
+
 /// Render a frame
 pub fn render(self: *Self) !void {
     // Update FPS counter

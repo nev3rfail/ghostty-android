@@ -67,6 +67,7 @@ class GhosttyRenderer(
     private external fun nativeSetFontSize(fontSize: Int)
     private external fun nativeProcessInput(ansiSequence: String)
     private external fun nativeProcessInputBytes(bytes: ByteArray, length: Int)
+    private external fun nativeHasActiveAnimation(): Boolean
 
     // Scrolling native methods
     private external fun nativeGetScrollbackRows(): Int
@@ -218,9 +219,21 @@ class GhosttyRenderer(
      *
      * @param gl The GL10 interface (not used, we use native GLES3)
      */
+    /**
+     * Asks the host for another frame.
+     *
+     * The surface only draws on demand, so anything that changes what is on
+     * screen has to say so. Set by the view that owns this renderer.
+     */
+    var renderRequester: (() -> Unit)? = null
+
     override fun onDrawFrame(gl: GL10?) {
         try {
             nativeOnDrawFrame()
+
+            // Ripple, sweep and the mic pulse advance from elapsed time, so they
+            // need frames until they finish.
+            if (nativeHasActiveAnimation()) renderRequester?.invoke()
         } catch (e: Exception) {
             Log.e(TAG, "Error in nativeOnDrawFrame", e)
             // Don't throw here to avoid crashing the render thread
@@ -339,6 +352,7 @@ class GhosttyRenderer(
 
         try {
             nativeProcessInput(ansiSequence)
+            renderRequester?.invoke()
         } catch (e: Exception) {
             Log.e(TAG, "Error in nativeProcessInput", e)
         }
@@ -357,6 +371,7 @@ class GhosttyRenderer(
     fun processInput(bytes: ByteArray, length: Int) {
         try {
             nativeProcessInputBytes(bytes, length)
+            renderRequester?.invoke()
         } catch (e: Exception) {
             Log.e(TAG, "Error in nativeProcessInputBytes", e)
         }

@@ -497,9 +497,11 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
             }
         }
 
-        // Set render mode to continuously for proof of concept
-        // TODO: Change to RENDERMODE_WHEN_DIRTY once we have proper terminal update callbacks
-        renderMode = RENDERMODE_CONTINUOUSLY
+        // Draw only when something changed. Everything that alters the screen asks
+        // for a frame: terminal output through the renderer, gestures and resizes
+        // here, and animations from the renderer while they run.
+        renderer.renderRequester = { requestRender() }
+        renderMode = RENDERMODE_WHEN_DIRTY
 
         // Initialize scroll gesture detector
         gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
