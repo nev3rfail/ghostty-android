@@ -1,3 +1,8 @@
-*.sh text eol=lf
-*.zig text eol=lf
-gradlew text eol=lf
+# Keep every text file LF in the working tree so shell scripts, Zig sources and
+# shaders stay usable when the repository is cloned on Windows.
+* text=auto eol=lf
+
+*.jar binary
+*.png binary
+*.ttf binary
+*.otf binary
