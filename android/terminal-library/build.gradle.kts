@@ -100,9 +100,15 @@ tasks.register<Exec>("buildNativeLibs") {
     }
 }
 
-// Run native build before preBuild
+// Run native build before preBuild.
+// The Zig toolchain may live outside the Gradle host (a WSL distro, a remote box), in
+// which case the native libraries are built out-of-band by
+// scripts/build-android-nonix.sh. -PskipNativeBuild=true makes Gradle consume whatever
+// is already present in jniLibs.
 tasks.named("preBuild") {
-    dependsOn("buildNativeLibs")
+    if (!project.hasProperty("skipNativeBuild")) {
+        dependsOn("buildNativeLibs")
+    }
 }
 
 publishing {
