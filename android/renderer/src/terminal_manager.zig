@@ -8,6 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
+const cursor_style = @import("cursor_style.zig");
 
 const log = std.log.scoped(.terminal_manager);
 
@@ -227,9 +228,9 @@ pub fn updateRenderState(self: *TerminalManager) !void {
 /// Returns null if cursor should be hidden (visibility disabled, blink off, etc.)
 pub fn getCursorStyle(
     self: *const TerminalManager,
-    opts: ghostty_vt.RendererCursorStyleOptions,
-) ?ghostty_vt.RendererCursorStyle {
-    return ghostty_vt.rendererCursorStyle(&self.render_state, opts);
+    opts: cursor_style.StyleOptions,
+) ?cursor_style.Style {
+    return cursor_style.style(&self.render_state, opts);
 }
 
 /// Get cursor viewport position from render state
