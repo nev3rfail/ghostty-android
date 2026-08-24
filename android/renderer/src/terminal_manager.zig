@@ -12,12 +12,33 @@ const cursor_style = @import("cursor_style.zig");
 
 const log = std.log.scoped(.terminal_manager);
 
+/// The parser type `Terminal.vtStream()` hands back, named here because the vt
+/// module does not export it.
+const VtStream = @TypeOf(@as(*ghostty_vt.Terminal, undefined).vtStream());
+
 /// Terminal Manager manages a VT terminal instance
 pub const TerminalManager = @This();
 
 allocator: Allocator,
 terminal: ghostty_vt.Terminal,
 render_state: ghostty_vt.RenderState = .empty,
+
+/// The VT parser, kept for the life of the terminal.
+///
+/// A read from the pty ends wherever the kernel split it, which is regularly in
+/// the middle of an escape sequence. A parser built per read carries no state
+/// across that boundary, so a split sequence is lost: an erase that never
+/// applies leaves stale glyphs on screen, and a lost end-of-synchronized-output
+/// leaves the renderer never syncing again, which reads as a dead terminal with
+/// a live cursor.
+///
+/// Built on first use rather than in init, because it holds a pointer to the
+/// terminal and init returns by value.
+stream: ?VtStream = null,
+
+/// When the current synchronized update began, for bounding how long it holds
+/// the screen. Null while no update is in progress.
+sync_started_ms: ?i64 = null,
 
 /// Saved viewport anchor for scroll restoration across resize.
 /// This Pin tracks the content at the top-left of the viewport,
@@ -54,16 +75,16 @@ pub fn init(allocator: Allocator, cols: u16, rows: u16) !TerminalManager {
 /// Clean up terminal resources
 pub fn deinit(self: *TerminalManager) void {
     log.info("Deinitializing terminal", .{});
+    if (self.stream) |*stream| stream.deinit();
+    self.stream = null;
     self.render_state.deinit(self.allocator);
     self.terminal.deinit(self.allocator);
 }
 
 /// Process a slice of VT input (raw bytes including ANSI sequences)
 pub fn processInput(self: *TerminalManager, data: []const u8) !void {
-    var stream = self.terminal.vtStream();
-    defer stream.deinit();
-
-    try stream.nextSlice(data);
+    if (self.stream == null) self.stream = self.terminal.vtStream();
+    try self.stream.?.nextSlice(data);
     log.debug("Processed {} bytes of input", .{data.len});
 }
 
@@ -261,9 +282,27 @@ pub fn getContentRows(self: *TerminalManager) usize {
 /// Check if synchronized output mode is active (mode 2026).
 /// When active, the terminal is buffering changes and rendering should be deferred
 /// until the mode is disabled (ESC[?2026l).
+///
+/// The wait is bounded. A program that sets the mode and then dies, or whose
+/// end sequence never arrives, would otherwise hold the last frame on screen
+/// forever, so the mode is honoured only for as long as a frame plausibly takes
+/// to arrive.
 pub fn isSynchronizedOutputActive(self: *TerminalManager) bool {
-    return self.terminal.modes.get(.synchronized_output);
+    if (!self.terminal.modes.get(.synchronized_output)) {
+        self.sync_started_ms = null;
+        return false;
+    }
+
+    const now = std.time.milliTimestamp();
+    const started = self.sync_started_ms orelse {
+        self.sync_started_ms = now;
+        return true;
+    };
+    return now - started < sync_deadline_ms;
 }
+
+/// How long a synchronized update is honoured before the screen is drawn anyway.
+const sync_deadline_ms: i64 = 250;
 
 // =============================================================================
 // Selection API

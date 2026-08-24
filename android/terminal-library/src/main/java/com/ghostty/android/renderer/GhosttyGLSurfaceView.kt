@@ -196,6 +196,8 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
         private const val TWO_FINGER_DOUBLE_TAP_TIMEOUT_MS = 300L
 
         // Sweep direction constants (animation timing is managed in native renderer)
+        private const val FOLLOW_UP_FRAME_MS = 300L
+
         private const val SWEEP_UP = 1
         private const val SWEEP_DOWN = 2
     }
@@ -500,7 +502,16 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
         // Draw only when something changed. Everything that alters the screen asks
         // for a frame: terminal output through the renderer, gestures and resizes
         // here, and animations from the renderer while they run.
-        renderer.renderRequester = { requestRender() }
+        // One frame is asked for again shortly after, because a program can end
+        // its output in the middle of a synchronized update. The renderer holds
+        // the previous picture for the length of one, and with no later frame to
+        // draw, that picture is the last thing shown -- a screen that stops
+        // where the program's final write began.
+        renderer.renderRequester = {
+            requestRender()
+            removeCallbacks(followUpFrame)
+            postDelayed(followUpFrame, FOLLOW_UP_FRAME_MS)
+        }
         renderMode = RENDERMODE_WHEN_DIRTY
 
         // Initialize scroll gesture detector
@@ -1141,6 +1152,8 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
      * modifier: set this, and the next committed character is folded to its
      * control code.
      */
+    private val followUpFrame = Runnable { requestRender() }
+
     var ctrlPending: Boolean = false
 
     /** Apply Alt to the next character typed, sending it with a meta prefix. */
