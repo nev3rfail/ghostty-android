@@ -1146,6 +1146,9 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     /** Apply Alt to the next character typed, sending it with a meta prefix. */
     var altPending: Boolean = false
 
+    /** A keyboard has been asked for and the input method has yet to accept. */
+    private var keyboardRequested: Boolean = false
+
     /**
      * Called once a sticky modifier has been consumed, so a host can drop
      * whatever it shows for it.
@@ -1169,11 +1172,42 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
         return TerminalInputConnection()
     }
 
-    /** Take focus and ask the system to raise the soft keyboard. */
+    /**
+     * Take focus and ask the system to raise the soft keyboard.
+     *
+     * The request is remembered rather than made once. An input method only
+     * accepts it for the view it is currently serving, and it starts serving
+     * this view a moment after the view takes focus in a focused window --
+     * asking before that happens is ignored, which is what happens when the
+     * keyboard is asked for as soon as the view is created.
+     */
     fun showKeyboard() {
+        keyboardRequested = true
         requestFocus()
+        raiseKeyboardIfServed()
+    }
+
+    /** Withdraw a pending request, so a later focus change does not honour it. */
+    fun hideKeyboard() {
+        keyboardRequested = false
         val manager = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        manager.showSoftInput(this, 0)
+        manager.hideSoftInputFromWindow(windowToken, 0)
+    }
+
+    private fun raiseKeyboardIfServed() {
+        if (!keyboardRequested || !hasWindowFocus() || !isFocused) return
+        val manager = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        if (manager.showSoftInput(this, 0)) keyboardRequested = false
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        if (hasWindowFocus) raiseKeyboardIfServed()
+    }
+
+    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        if (gainFocus) raiseKeyboardIfServed()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
