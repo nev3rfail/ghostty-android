@@ -99,7 +99,7 @@ pub fn resize(self: *TerminalManager, cols: u16, rows: u16) !void {
     log.info("Terminal modes: wraparound={}", .{wraparound_enabled});
 
     // Get some terminal content before resize for debugging
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     const cursor_before = screen.cursor;
     log.info("Before resize: cursor at ({}, {}), pending_wrap={}", .{
         cursor_before.x, cursor_before.y, cursor_before.pending_wrap
@@ -113,7 +113,7 @@ pub fn resize(self: *TerminalManager, cols: u16, rows: u16) !void {
     );
 
     // Check state after resize
-    const cursor_after = self.terminal.screens.get(.primary).?.cursor;
+    const cursor_after = self.terminal.screens.active.cursor;
     log.info("After resize: cursor at ({}, {}), pending_wrap={}", .{
         cursor_after.x, cursor_after.y, cursor_after.pending_wrap
     });
@@ -138,7 +138,7 @@ pub fn getTerminal(self: *TerminalManager) *ghostty_vt.Terminal {
 
 /// Get the number of scrollback rows available (rows above the active area)
 pub fn getScrollbackRows(self: *TerminalManager) usize {
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     // total_rows includes both scrollback and active area
     // scrollback = total_rows - active_rows
     const total = screen.pages.total_rows;
@@ -153,27 +153,27 @@ pub fn getScrollbackRows(self: *TerminalManager) usize {
 /// Positive delta scrolls down (towards newer content/active area)
 /// Negative delta scrolls up (towards older content/scrollback)
 pub fn scrollDelta(self: *TerminalManager, delta: i32) void {
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     screen.pages.scroll(.{ .delta_row = delta });
     log.debug("Scrolled viewport by {} rows", .{delta});
 }
 
 /// Check if viewport is at the bottom (following active area)
 pub fn isViewportAtBottom(self: *TerminalManager) bool {
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     return screen.viewportIsBottom();
 }
 
 /// Get the current scroll offset from the top (0 = at top of scrollback)
 pub fn getViewportOffset(self: *TerminalManager) usize {
-    var screen = self.terminal.screens.get(.primary).?;
+    var screen = self.terminal.screens.active;
     const scrollbar = screen.pages.scrollbar();
     return scrollbar.offset;
 }
 
 /// Scroll viewport to the bottom (active area)
 pub fn scrollToBottom(self: *TerminalManager) void {
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     screen.pages.scroll(.active);
     log.debug("Scrolled viewport to bottom (active area)", .{});
 }
@@ -182,7 +182,7 @@ pub fn scrollToBottom(self: *TerminalManager) void {
 /// Row 0 is the top of scrollback, and increases towards the active area
 /// Use getViewportOffset() to get the current offset for later restoration
 pub fn scrollToViewportOffset(self: *TerminalManager, row: usize) void {
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     screen.pages.scroll(.{ .row = row });
     log.debug("Scrolled viewport to row {}", .{row});
 }
@@ -202,7 +202,7 @@ pub fn saveViewportAnchor(self: *TerminalManager) void {
         return;
     }
 
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     const pt = point.Point{ .viewport = .{ .x = 0, .y = 0 } };
 
     if (screen.pages.pin(pt)) |pin| {
@@ -226,7 +226,7 @@ pub fn restoreViewportAnchor(self: *TerminalManager) void {
     // Clear saved anchor
     self.saved_viewport_anchor = null;
 
-    var screen = self.terminal.screens.get(.primary).?;
+    var screen = self.terminal.screens.active;
 
     // Convert Pin to screen coordinates (absolute row from top of buffer)
     const screen_pt = screen.pages.pointFromPin(.screen, anchor) orelse {
@@ -274,7 +274,7 @@ pub const CursorViewport = struct {
 /// Get the number of content rows (cursor Y position + 1)
 /// This represents the rows that actually have content rendered
 pub fn getContentRows(self: *TerminalManager) usize {
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     // cursor.y is 0-indexed, so add 1 for total rows with content
     return @as(usize, screen.cursor.y) + 1;
 }
@@ -322,7 +322,7 @@ pub const SelectionBounds = struct {
 /// Start a new selection at the given viewport coordinates.
 /// This creates an initial selection with start and end at the same point.
 pub fn startSelection(self: *TerminalManager, col: u16, row: u16) !void {
-    var screen = self.terminal.screens.get(.primary).?;
+    var screen = self.terminal.screens.active;
 
     // Convert viewport coordinates to a Pin
     const pt = point.Point{ .viewport = .{ .x = col, .y = row } };
@@ -341,7 +341,7 @@ pub fn startSelection(self: *TerminalManager, col: u16, row: u16) !void {
 /// Update the end point of the current selection.
 /// If no selection exists, this is a no-op.
 pub fn updateSelection(self: *TerminalManager, col: u16, row: u16) !void {
-    var screen = self.terminal.screens.get(.primary).?;
+    var screen = self.terminal.screens.active;
 
     // Get current selection
     var sel = screen.selection orelse return;
@@ -362,14 +362,14 @@ pub fn updateSelection(self: *TerminalManager, col: u16, row: u16) !void {
 
 /// Clear the current selection.
 pub fn clearSelection(self: *TerminalManager) void {
-    var screen = self.terminal.screens.get(.primary).?;
+    var screen = self.terminal.screens.active;
     screen.clearSelection();
     log.debug("Cleared selection", .{});
 }
 
 /// Check if there is an active selection.
 pub fn hasSelection(self: *TerminalManager) bool {
-    const screen = self.terminal.screens.get(.primary).?;
+    const screen = self.terminal.screens.active;
     return screen.selection != null;
 }
 
@@ -377,7 +377,7 @@ pub fn hasSelection(self: *TerminalManager) bool {
 /// Returns null if no selection exists.
 /// Caller owns the returned memory and must free it with the allocator.
 pub fn getSelectionText(self: *TerminalManager) !?[:0]const u8 {
-    var screen = self.terminal.screens.get(.primary).?;
+    var screen = self.terminal.screens.active;
 
     const sel = screen.selection orelse return null;
 
@@ -390,7 +390,7 @@ pub fn getSelectionText(self: *TerminalManager) !?[:0]const u8 {
 /// Get the selection bounds in viewport coordinates.
 /// Returns null if no selection exists.
 pub fn getSelectionBounds(self: *TerminalManager) ?SelectionBounds {
-    var screen = self.terminal.screens.get(.primary).?;
+    var screen = self.terminal.screens.active;
 
     const sel = screen.selection orelse return null;
 
@@ -473,7 +473,7 @@ pub fn getHyperlinkAtCell(self: *TerminalManager, col: u16, row: u16) !?[]const 
 /// Returns a null-terminated string containing the viewport content.
 /// Caller owns the returned memory and must free it with the allocator.
 pub fn getViewportTextVT(self: *TerminalManager) !?[:0]const u8 {
-    var screen = self.terminal.screens.get(.primary) orelse return null;
+    var screen = self.terminal.screens.active;
 
     // Get the visible viewport bounds using the proper PageList API
     // This returns only the visible portion, not the entire scrollback buffer

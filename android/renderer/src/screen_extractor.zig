@@ -71,7 +71,11 @@ pub fn extractCells(
     var cells = try std.ArrayList(CellData).initCapacity(allocator, total_cells);
     errdefer cells.deinit(allocator);
 
-    const screen = terminal.screens.get(.primary).?;
+    // The active screen, not the primary one: a full-screen program switches to
+    // the alternate screen and draws everything there, leaving the primary as it
+    // was. Reading the primary renders the picture from before the switch while
+    // the cursor, which follows the active screen, keeps moving over it.
+    const screen = terminal.screens.active;
     const palette = &terminal.colors.palette.current;
 
     // Default colors
@@ -86,8 +90,9 @@ pub fn extractCells(
     while (row < rows) : (row += 1) {
         var col: usize = 0;
         while (col < cols) : (col += 1) {
-            // Pin to the viewport coordinates
-            // Note: viewport should follow active area via scroll(.active) after output
+            // Pin to the viewport coordinates. While the viewport is pinned to
+            // the active area it follows new output on its own; it stays put
+            // only once someone scrolls back through the history.
             const pin = screen.pages.pin(.{ .viewport = .{
                 .x = @intCast(col),
                 .y = @intCast(row),

@@ -1075,7 +1075,7 @@ pub fn updateFontSize(self: *Self, new_font_size: u32) !void {
 
         // Sample some terminal content before resize
         const terminal = self.terminal_manager.getTerminal();
-        const screen = terminal.screens.get(.primary).?;
+        const screen = terminal.screens.active;
         log.info("Before resize: screen has {} total rows, cursor at row {}", .{
             screen.pages.total_rows, screen.cursor.y
         });
@@ -1087,7 +1087,7 @@ pub fn updateFontSize(self: *Self, new_font_size: u32) !void {
         log.info("Terminal size after resize: {d}x{d}", .{ new_size.cols, new_size.rows });
 
         // Check if content changed after resize
-        const screen_after = terminal.screens.get(.primary).?;
+        const screen_after = terminal.screens.active;
         log.info("After resize: screen has {} total rows, cursor at row {}", .{
             screen_after.pages.total_rows, screen_after.cursor.y
         });
