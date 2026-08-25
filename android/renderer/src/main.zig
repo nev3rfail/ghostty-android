@@ -1466,6 +1466,36 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetViewportTex
 }
 
 // ============================================================================
+// Clipboard JNI Methods
+// ============================================================================
+
+/// Take the text an OSC 52 write asked to put on the clipboard
+/// Java signature: String nativeTakeClipboardWrite()
+/// Returns the text, or null if no program asked since the last call
+export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeTakeClipboardWrite(
+    env: *c.JNIEnv,
+    obj: c.jobject,
+) c.jstring {
+    const handle = getNativeHandle(env, obj);
+    if (handle == 0) return null;
+
+    const state = getRendererState(handle) orelse return null;
+    if (!state.initialized) return null;
+
+    if (state.renderer) |*renderer| {
+        if (renderer.terminal_manager.takeClipboardWrite()) |text| {
+            defer gpa.allocator().free(text);
+            return jni.newJString(env, text) catch |err| {
+                log.err("Failed to create JNI string for clipboard write: {}", .{err});
+                return null;
+            };
+        }
+    }
+
+    return null;
+}
+
+// ============================================================================
 // Hyperlink JNI Methods
 // ============================================================================
 
@@ -1555,4 +1585,6 @@ comptime {
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetViewportTextVT;
     // Hyperlink methods
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetHyperlinkAtCell;
+    // Clipboard methods
+    _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeTakeClipboardWrite;
 }

@@ -113,6 +113,7 @@ class GhosttyRenderer(
 
     // Hyperlink native methods
     private external fun nativeGetHyperlinkAtCell(col: Int, row: Int): String?
+    private external fun nativeTakeClipboardWrite(): String?
 
     // Viewport text native method (with VT/ANSI sequences for voice command detection)
     private external fun nativeGetViewportTextVT(): String?
@@ -796,6 +797,19 @@ class GhosttyRenderer(
      * @param row Row index (0-based, in viewport coordinates)
      * @return The hyperlink URI, or null if no hyperlink at that position
      */
+    /**
+     * The text a program asked to have put on the clipboard with OSC 52, or null
+     * if none has since the last call. Consumers poll this after feeding output.
+     */
+    fun takeClipboardWrite(): String? {
+        return try {
+            nativeTakeClipboardWrite()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in nativeTakeClipboardWrite", e)
+            null
+        }
+    }
+
     fun getHyperlinkAtCell(col: Int, row: Int): String? {
         return try {
             nativeGetHyperlinkAtCell(col, row)
