@@ -29,10 +29,21 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+
+        // Required for JNI.
+        .link_libc = true,
     });
 
     // Add FreeType module
-    lib_mod.addImport("freetype", freetype_dep.module("freetype"));
+    //
+    // Bionic annotates array parameters with nullability qualifiers, which the
+    // C frontend behind @cImport rejects on a type that is not a pointer. The
+    // qualifiers only document intent to a C compiler and nothing about them
+    // survives translation, so they are defined away.
+    const freetype_mod = freetype_dep.module("freetype");
+    freetype_mod.addCMacro("_Nonnull", "");
+    freetype_mod.addCMacro("_Nullable", "");
+    lib_mod.addImport("freetype", freetype_mod);
 
     // Add libghostty-vt module (using the Zig module, not C ABI)
     lib_mod.addImport("ghostty-vt", vt_dep.module("ghostty-vt"));
@@ -44,11 +55,8 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
     });
 
-    // Link libc (required for JNI)
-    lib.linkLibC();
-
     // Link FreeType library
-    lib.linkLibrary(freetype_dep.artifact("freetype"));
+    lib_mod.linkLibrary(freetype_dep.artifact("freetype"));
 
     // Note: We need OpenGL ES 3.1 symbols, but can't link them during cross-compilation.
     // The symbols will be left undefined and must be resolved by the Android dynamic linker.
@@ -56,7 +64,7 @@ pub fn build(b: *std.Build) void {
 
     // Add include paths for libghostty-vt headers (if needed in future)
     const ghostty_include = b.path("../../libghostty-vt/include");
-    lib.addIncludePath(ghostty_include);
+    lib_mod.addIncludePath(ghostty_include);
 
     // Install the shared library
     b.installArtifact(lib);

@@ -41,6 +41,25 @@ TOOLCHAIN=$PREBUILT/linux-$(uname -m)
 SYSROOT=$TOOLCHAIN/sysroot
 CLANG_VERSION=$(ls "$TOOLCHAIN/lib/clang" | head -1)
 
+# The vt library's build reaches for the NDK itself, through a helper that names
+# the sysroot with a host tag hardcoded per operating system, so it only finds an
+# NDK built for the host it runs on. Point it at a shadow root whose single
+# prebuilt directory carries the name that helper looks for.
+case $(uname -s) in
+  Linux)  HOST_TAG=linux-x86_64  ;;
+  Darwin) HOST_TAG=darwin-x86_64 ;;
+  *)      HOST_TAG=$(basename "$TOOLCHAIN") ;;
+esac
+if [ "$(basename "$TOOLCHAIN")" = "$HOST_TAG" ]; then
+  export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
+else
+  SHADOW=$CACHE_ROOT/ndk/toolchains/llvm/prebuilt
+  rm -rf "$SHADOW"
+  mkdir -p "$SHADOW"
+  ln -s "$TOOLCHAIN" "$SHADOW/$HOST_TAG"
+  export ANDROID_NDK_HOME=$CACHE_ROOT/ndk
+fi
+
 # Zig resolves Android libc from an explicit libc file rather than the NDK's clang.
 LIBC_FILE=$CACHE_ROOT/android-$ABI-libc.txt
 mkdir -p "$CACHE_ROOT" "$OUTPUT_DIR"
@@ -62,8 +81,8 @@ export ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR:-$CACHE_ROOT/global}
 common=(-Dtarget="$TRIPLE.$API" -Doptimize=ReleaseFast --libc "$LIBC_FILE")
 
 echo "== libghostty-vt ($ABI, API $API) =="
-"$ZIG" build lib-vt "${common[@]}" \
-  -Dapp-runtime=none -Dsimd=false -Dcpu=baseline \
+"$ZIG" build "${common[@]}" \
+  -Demit-lib-vt=true -Dapp-runtime=none -Dsimd=false -Dcpu=baseline \
   --cache-dir "$CACHE_ROOT/vt-$ABI" \
   --build-file "$ROOT/libghostty-vt/build.zig"
 cp "$ROOT/libghostty-vt/zig-out/lib/libghostty-vt.so" "$OUTPUT_DIR/"

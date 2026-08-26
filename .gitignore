@@ -3,6 +3,7 @@
 zig-cache/
 .zig-cache/
 zig-out/
+zig-pkg/
 *.o
 *.a
 *.so

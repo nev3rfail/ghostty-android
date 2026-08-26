@@ -3,7 +3,7 @@
     .version = "0.1.0",
     .paths = .{""},
     .fingerprint = 0x227859ace74b155b,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .freetype = .{ .path = "../../libghostty-vt/pkg/freetype" },
         .@"ghostty-vt" = .{ .path = "../../libghostty-vt" },
