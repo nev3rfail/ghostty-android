@@ -30,8 +30,13 @@ case $ABI in
   *) echo "Unknown ABI: $ABI" >&2; exit 1 ;;
 esac
 
-# The NDK ships one host toolchain; its sysroot is host-independent.
-TOOLCHAIN=$(echo "$ANDROID_NDK_ROOT"/toolchains/llvm/prebuilt/*)
+# The NDK usually ships one host toolchain and its sysroot is host-independent, so
+# any host's NDK will do. A rebuild for another host can sit beside the official
+# one, though, and then the glob matches more than one directory -- so prefer the
+# toolchain built for this machine and fall back to whatever single one is there.
+PREBUILT=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt
+TOOLCHAIN=$PREBUILT/linux-$(uname -m)
+[ -d "$TOOLCHAIN" ] || TOOLCHAIN=$(echo "$PREBUILT"/*)
 [ -d "$TOOLCHAIN" ] || { echo "No NDK toolchain under $ANDROID_NDK_ROOT" >&2; exit 1; }
 SYSROOT=$TOOLCHAIN/sysroot
 CLANG_VERSION=$(ls "$TOOLCHAIN/lib/clang" | head -1)
@@ -51,7 +56,9 @@ gcc_dir=
 EOF
 
 # Caches live outside the source tree so a source tree on a slow mount stays cheap.
-export ZIG_GLOBAL_CACHE_DIR=$CACHE_ROOT/global
+# A caller that already has a package cache keeps it: fetching these again costs
+# a network round trip per dependency, and some hosts have no resolver at all.
+export ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR:-$CACHE_ROOT/global}
 common=(-Dtarget="$TRIPLE.$API" -Doptimize=ReleaseFast --libc "$LIBC_FILE")
 
 echo "== libghostty-vt ($ABI, API $API) =="
