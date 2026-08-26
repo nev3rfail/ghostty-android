@@ -1124,6 +1124,14 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     private var keyboardRequested: Boolean = false
 
     /**
+     * Whether a pending request has had an input method's attention: this view
+     * focused, in a focused window. A request survives its first such moment and
+     * is dropped once that moment passes, so it cannot fire at an unrelated focus
+     * change later.
+     */
+    private var keyboardRequestOffered: Boolean = false
+
+    /**
      * Called once a sticky modifier has been consumed, so a host can drop
      * whatever it shows for it.
      */
@@ -1157,31 +1165,56 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
      */
     fun showKeyboard() {
         keyboardRequested = true
+        keyboardRequestOffered = false
+        Log.d(TAG, "keyboard requested")
         requestFocus()
         raiseKeyboardIfServed()
     }
 
     /** Withdraw a pending request, so a later focus change does not honour it. */
     fun hideKeyboard() {
+        if (keyboardRequested) Log.d(TAG, "keyboard request withdrawn")
         keyboardRequested = false
+        keyboardRequestOffered = false
         val manager = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         manager.hideSoftInputFromWindow(windowToken, 0)
     }
 
     private fun raiseKeyboardIfServed() {
         if (!keyboardRequested || !hasWindowFocus() || !isFocused) return
+        keyboardRequestOffered = true
         val manager = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        if (manager.showSoftInput(this, 0)) keyboardRequested = false
+        if (manager.showSoftInput(this, 0)) {
+            keyboardRequested = false
+            Log.d(TAG, "keyboard request accepted")
+        }
+    }
+
+    /**
+     * Drops a request that has already had an input method's attention.
+     *
+     * A request made before any input method served the view keeps waiting, which
+     * is what makes a keyboard asked for at view creation arrive at all. One that
+     * has been offered and not taken is spent, and keeping it means a keyboard
+     * rising at whatever focus change comes next.
+     */
+    private fun expireKeyboardRequest() {
+        if (keyboardRequested && keyboardRequestOffered) {
+            keyboardRequested = false
+            Log.d(TAG, "keyboard request expired unserved")
+        }
     }
 
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
-        if (hasWindowFocus) raiseKeyboardIfServed()
+        Log.d(TAG, "window focus $hasWindowFocus, keyboard requested $keyboardRequested")
+        if (hasWindowFocus) raiseKeyboardIfServed() else expireKeyboardRequest()
     }
 
     override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
         super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
-        if (gainFocus) raiseKeyboardIfServed()
+        Log.d(TAG, "view focus $gainFocus, keyboard requested $keyboardRequested")
+        if (gainFocus) raiseKeyboardIfServed() else expireKeyboardRequest()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
