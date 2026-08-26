@@ -38,6 +38,26 @@ fun scrollStep(accumulatedPixels: Float, cellHeight: Float): ScrollStep {
 }
 
 /**
+ * The rows available in the direction travel points.
+ *
+ * [capacity] is the pair the renderer reports: rows above the viewport, then
+ * rows below it. Travel towards the active area at the bottom is positive, the
+ * same convention [scrollStep] uses.
+ *
+ * Travel of zero has no direction and finds no room. A capacity that is not a
+ * pair finds none either, because a reading that failed must refuse a gesture
+ * rather than invite one.
+ */
+fun rowsAvailable(pixels: Float, capacity: IntArray): Int {
+    if (capacity.size != 2) return 0
+    return when {
+        pixels > 0f -> capacity[1]
+        pixels < 0f -> capacity[0]
+        else -> 0
+    }.coerceAtLeast(0)
+}
+
+/**
  * What survives of a step the viewport refused.
  *
  * [rowsMoved] is the movement measured either side of applying the delta, which

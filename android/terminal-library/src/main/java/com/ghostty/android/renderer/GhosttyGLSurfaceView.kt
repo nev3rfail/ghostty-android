@@ -313,25 +313,40 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     /**
      * Applies finger travel to the viewport. GL thread only.
      *
-     * Travel accumulates until it crosses a row, the row delta goes to the
-     * terminal, and what the viewport actually moved decides what survives: a
-     * step the viewport refused leaves no remainder to build on, so a gesture
-     * cannot accumulate against a limit it has already reached.
+     * The renderer is asked how far the viewport may travel before any of the
+     * travel is kept. With no room in the direction the finger points, nothing
+     * accumulates and no sub-row shift is drawn, so the picture holds still
+     * instead of shearing by part of a row and returning.
      *
-     * The alternative is to ask the terminal whether it has reached the top, and
-     * the answer is a viewport offset that reads as zero for more reasons than
-     * having arrived there. A boundary resting on it stays true once it is true.
+     * With room, travel accumulates until it crosses a row and the row delta
+     * goes to the terminal, clamped to the room reported. What the viewport
+     * actually moved still decides what survives: the capacity is read before
+     * the movement it authorises, and a resize landing between the two would
+     * otherwise go unnoticed.
      */
     private fun applyScrollPixels(pixels: Float) {
+        val available = rowsAvailable(pixels, renderer.getScrollCapacity())
+        if (available == 0) {
+            // The offset channel is shared with the keyboard overlay's shift, so
+            // a refusal leaves that shift standing rather than flattening it.
+            glScrollPixels = 0f
+            visualScrollResidual = 0f
+            renderer.setScrollPixelOffset(if (shouldScrollContentWithOverlay) bottomOffset else 0f)
+            requestRender()
+            post { onScrollRefused(pixels) }
+            return
+        }
+
         glScrollPixels += pixels
         val step = scrollStep(glScrollPixels, renderer.getFontLineSpacing())
 
         val applied = if (step.rows == 0) {
             step
         } else {
+            val asked = step.rows.coerceIn(-available, available)
             val before = renderer.getViewportOffset()
-            renderer.scrollDelta(step.rows)
-            afterMovement(step, renderer.getViewportOffset() - before)
+            renderer.scrollDelta(asked)
+            afterMovement(ScrollStep(asked, step.residual), renderer.getViewportOffset() - before)
         }
 
         glScrollPixels = applied.residual

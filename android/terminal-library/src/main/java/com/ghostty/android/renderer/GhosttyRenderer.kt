@@ -107,6 +107,9 @@ class GhosttyRenderer(
     private external fun nativeScrollDelta(delta: Int)
     private external fun nativeIsViewportAtBottom(): Boolean
     private external fun nativeGetViewportOffset(): Int
+
+    // Scroll capacity native method - returns [above, below]
+    private external fun nativeGetScrollCapacity(): IntArray
     private external fun nativeScrollToBottom()
     private external fun nativeScrollToViewportOffset(row: Int)
     private external fun nativeSetScrollPixelOffset(offset: Float)
@@ -529,6 +532,22 @@ class GhosttyRenderer(
             } catch (e: Exception) {
                 Log.e(TAG, "Error in nativeGetViewportOffset", e)
                 0
+            }
+        }
+    }
+
+    /**
+     * Get the rows the viewport can travel, above it and below it.
+     *
+     * @return IntArray of [above, below], or [0, 0] if not available
+     */
+    fun getScrollCapacity(): IntArray {
+        synchronized(terminalLock) {
+            return try {
+                nativeGetScrollCapacity()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetScrollCapacity", e)
+                intArrayOf(0, 0)
             }
         }
     }

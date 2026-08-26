@@ -86,6 +86,61 @@ class ScrollArithmeticTest {
         assertEquals(ScrollStep.None, next)
     }
 
+    @Test
+    fun `travel up against no rows above finds no room`() {
+        assertEquals(0, rowsAvailable(pixels = -CELL, capacity = intArrayOf(0, 40)))
+    }
+
+    @Test
+    fun `travel down against no rows below finds no room`() {
+        assertEquals(0, rowsAvailable(pixels = CELL, capacity = intArrayOf(40, 0)))
+    }
+
+    @Test
+    fun `room in the direction asked is reported whatever the other side holds`() {
+        assertEquals(7, rowsAvailable(pixels = -CELL, capacity = intArrayOf(7, 0)))
+        assertEquals(7, rowsAvailable(pixels = CELL, capacity = intArrayOf(0, 7)))
+    }
+
+    @Test
+    fun `a buffer with no scrollback finds no room either way`() {
+        val none = intArrayOf(0, 0)
+        assertEquals(0, rowsAvailable(pixels = -CELL, capacity = none))
+        assertEquals(0, rowsAvailable(pixels = CELL, capacity = none))
+    }
+
+    @Test
+    fun `travel of nothing has no direction`() {
+        assertEquals(0, rowsAvailable(pixels = 0f, capacity = intArrayOf(40, 40)))
+    }
+
+    @Test
+    fun `a capacity that is not a pair refuses`() {
+        assertEquals(0, rowsAvailable(pixels = -CELL, capacity = intArrayOf()))
+        assertEquals(0, rowsAvailable(pixels = CELL, capacity = intArrayOf(40)))
+        assertEquals(0, rowsAvailable(pixels = CELL, capacity = intArrayOf(1, 2, 3)))
+    }
+
+    @Test
+    fun `a step keeps the sign of the travel that produced it`() {
+        // The clamp in the view picks its bound from the sign of the travel, so
+        // a step may never disagree with it. The residual is always inside one
+        // row and never negative, which is what makes that hold.
+        var residual = 0f
+        var pixels = -3.5f
+        while (pixels <= 3.5f) {
+            val step = scrollStep(residual + pixels, CELL)
+            if (step.rows != 0) {
+                assertTrue(
+                    "step ${step.rows} disagrees with travel $pixels at residual $residual",
+                    (step.rows > 0) == (pixels > 0f),
+                )
+            }
+            residual = step.residual
+            pixels += 0.37f
+        }
+    }
+
     private companion object {
         const val CELL = 24f
         const val EPSILON = 0.001f
