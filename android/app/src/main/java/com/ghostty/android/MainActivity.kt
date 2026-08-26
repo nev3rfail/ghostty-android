@@ -1,9 +1,7 @@
 package com.ghostty.android
 
-import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
-import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -35,7 +33,13 @@ class MainActivity : ComponentActivity() {
         // Keep screen on while terminal is active
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        terminalSession = agentSession()
+        terminalSession = TerminalSession(
+            environment = TerminalSession.defaultEnvironment(
+                home = filesDir.absolutePath,
+                tmp = cacheDir.absolutePath,
+            ),
+            cwd = filesDir.absolutePath,
+        )
 
         // A test id switches the app into the visual regression harness; without
         // one it is a terminal.
@@ -83,67 +87,6 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         terminalSession.stop()
-    }
-
-    /**
-     * A session on the staged agent, or on a shell while there is nothing
-     * staged to run.
-     *
-     * The agent is a Linux binary. What it needs from the platform is assembled
-     * here: a home directory it may write, a resolver it can read, and on
-     * x86_64 a tracer that rewrites the syscalls Android refuses.
-     */
-    private fun agentSession(): TerminalSession {
-        val environment = TerminalSession.defaultEnvironment(
-            home = filesDir.absolutePath,
-            tmp = cacheDir.absolutePath,
-        ).toMutableMap()
-
-        val staged = File(filesDir, STAGE_DIRECTORY)
-        val agent = File(staged, "claude")
-        if (!agent.canExecute()) {
-            return TerminalSession(
-                environment = environment,
-                cwd = filesDir.absolutePath,
-            )
-        }
-
-        // Android answers a name lookup through netd rather than through a
-        // nameserver in /etc/resolv.conf, so a program carrying its own
-        // resolver has nothing to read. The tracer redirects /etc at this
-        // directory; the file it will find there is written here.
-        val etc = File(staged, "etc")
-        etc.mkdirs()
-        val resolvConf = File(etc, "resolv.conf")
-        if (!resolvConf.exists()) {
-            resolvConf.writeText(PUBLIC_RESOLVERS)
-        }
-        environment["SYSCALL_SHIM_ETC"] = etc.absolutePath
-
-        // The aarch64 Linux ABI has only the *at syscalls, which is exactly
-        // what Android's seccomp policy allows, so nothing needs rewriting
-        // there. x86_64 still offers the legacy calls and the agent's runtime
-        // uses them.
-        val shim = File(applicationInfo.nativeLibraryDir, "libsyscallshim.so")
-        val needsShim = Build.SUPPORTED_ABIS.firstOrNull() == "x86_64"
-        val command = if (needsShim && shim.canExecute()) shim else agent
-        val argv = if (command == shim) {
-            listOf(shim.absolutePath, agent.absolutePath)
-        } else {
-            listOf(agent.absolutePath)
-        }
-
-        return TerminalSession(
-            command = command.absolutePath,
-            argv = argv,
-            environment = environment,
-            cwd = filesDir.absolutePath,
-        )
-    }
-
-    private companion object {
-        const val STAGE_DIRECTORY = "claude"
-        const val PUBLIC_RESOLVERS = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n"
     }
 }
 
