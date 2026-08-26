@@ -11,6 +11,7 @@
 #   ANDROID_NDK_ROOT    NDK root                  (required)
 #   ANDROID_MIN_API     target API level          (default: 24)
 #   ZIG_CACHE_ROOT      build cache location      (default: /tmp/ghostty-android-cache)
+#   ZIG_LIB_DIR         zig standard library      (default: the compiler's own)
 
 set -euo pipefail
 
@@ -73,6 +74,51 @@ msvc_lib_dir=
 kernel32_lib_dir=
 gcc_dir=
 EOF
+
+# One level of a shadow directory: every entry symlinked back to the real tree,
+# except the one name that has to stay real so the level below it can be
+# shadowed in turn.
+shadow_level() {
+  mkdir -p "$2"
+  for entry in "$1"/*; do
+    name=$(basename "$entry")
+    [ "$name" = "$3" ] || ln -s "$entry" "$2/$name"
+  done
+}
+
+# The options step materialises its generated file from an unnamed temporary
+# with a hard link, and Android refuses to hard link inside an app's own
+# storage, so a build that runs on the phone fails with AccessDenied before it
+# compiles anything. A named temporary reaches the same destination through a
+# rename, and which kind gets created is one word in the standard library. So
+# hand the compiler a shadow standard library: symlinks to the real tree at
+# every level, and one patched copy of the file that chooses. A compiler whose
+# options step already renames does not carry that word, and its absence is
+# what switches this off. A caller who names its own ZIG_LIB_DIR keeps it.
+if [ -z "${ZIG_LIB_DIR:-}" ]; then
+  ZIG_LIB=$("$ZIG" env | sed -n 's/^ *\.lib_dir = "\(.*\)",*$/\1/p')
+  OPTIONS_ZIG=$ZIG_LIB/std/Build/Step/Options.zig
+  PROBE=$CACHE_ROOT/hardlink-probe
+  rm -f "$PROBE" "$PROBE.link"
+  : > "$PROBE"
+  if ! ln "$PROBE" "$PROBE.link" 2>/dev/null && grep -q '\.replace = false,' "$OPTIONS_ZIG"; then
+    SHADOW_LIB=$CACHE_ROOT/zig-lib
+    rm -rf "$SHADOW_LIB"
+    shadow_level "$ZIG_LIB"                  "$SHADOW_LIB"                  std
+    shadow_level "$ZIG_LIB/std"              "$SHADOW_LIB/std"              Build
+    shadow_level "$ZIG_LIB/std/Build"        "$SHADOW_LIB/std/Build"        Step
+    shadow_level "$ZIG_LIB/std/Build/Step"   "$SHADOW_LIB/std/Build/Step"   Options.zig
+    sed 's/\.replace = false,/.replace = true,/' "$OPTIONS_ZIG" \
+      > "$SHADOW_LIB/std/Build/Step/Options.zig"
+    if cmp -s "$OPTIONS_ZIG" "$SHADOW_LIB/std/Build/Step/Options.zig"; then
+      echo "The shadow standard library is identical to the real one: the patch matched nothing" >&2
+      exit 1
+    fi
+    export ZIG_LIB_DIR=$SHADOW_LIB
+    echo "== shadow standard library ($SHADOW_LIB) =="
+  fi
+  rm -f "$PROBE" "$PROBE.link"
+fi
 
 # Caches live outside the source tree so a source tree on a slow mount stays cheap.
 # A caller that already has a package cache keeps it: fetching these again costs
