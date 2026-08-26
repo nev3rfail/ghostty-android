@@ -152,11 +152,15 @@ interface TerminalEventListener {
  * @param context Android context
  * @param attrs XML attributes (optional, for XML inflation)
  * @param initialFontSize Initial font size in pixels (optional, for programmatic construction)
+ * @param maxScrollbackBytes Terminal history budget in bytes, or zero to leave the
+ *   terminal library its own. The page list enforces a floor of at least two of
+ *   its standard pages, so a smaller budget changes nothing.
  */
 class GhosttyGLSurfaceView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
-    initialFontSize: Float = 0f
+    initialFontSize: Float = 0f,
+    private val maxScrollbackBytes: Long = 0L
 ) : GLSurfaceView(context, attrs) {
 
     companion object {
@@ -521,7 +525,7 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
 
         // Create and set the renderer (pass context for DPI access and initial font size)
         // Always pass a valid font size (use currentFontSize which defaults to DEFAULT_FONT_SIZE)
-        renderer = GhosttyRenderer(context, currentFontSize.toInt())
+        renderer = GhosttyRenderer(context, currentFontSize.toInt(), maxScrollbackBytes)
         setRenderer(renderer)
 
         // Set up surface change callback to notify listener on main thread

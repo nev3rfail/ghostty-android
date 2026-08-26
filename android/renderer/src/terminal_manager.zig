@@ -78,11 +78,21 @@ clipboard_write: ?[]u8 = null,
 /// allowing us to restore the scroll position after terminal resize/reflow.
 saved_viewport_anchor: ?ghostty_vt.PageList.Pin = null,
 
-/// Initialize a new terminal with the specified size
-pub fn init(allocator: Allocator, cols: u16, rows: u16) !TerminalManager {
+/// Initialize a new terminal with the specified size.
+///
+/// `max_scrollback` is a budget in bytes, and null leaves the library's own.
+/// The page list enforces `@max(explicit_max_size, min_max_size)`, and
+/// `min_max_size` is at least two standard pages, so a budget below that has no
+/// effect at all: history is bounded by the floor rather than by the number.
+pub fn init(
+    allocator: Allocator,
+    cols: u16,
+    rows: u16,
+    max_scrollback: ?usize,
+) !TerminalManager {
     log.info("Initializing terminal: {}x{}", .{ cols, rows });
 
-    const terminal = try ghostty_vt.Terminal.init(allocator, .{
+    var opts: ghostty_vt.Terminal.Options = .{
         .cols = @intCast(cols),
         .rows = @intCast(rows),
         .default_modes = .{
@@ -90,7 +100,12 @@ pub fn init(allocator: Allocator, cols: u16, rows: u16) !TerminalManager {
             .wraparound = true, // Enable text reflow when terminal is resized
             .grapheme_cluster = true, // Enable proper grapheme width handling (mode 2027)
         },
-    });
+    };
+
+    // A caller that says nothing keeps whatever the library considers sane.
+    if (max_scrollback) |bytes| opts.max_scrollback = bytes;
+
+    const terminal = try ghostty_vt.Terminal.init(allocator, opts);
 
     // Verify modes were set correctly
     const wraparound_enabled = terminal.modes.get(.wraparound);

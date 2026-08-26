@@ -87,6 +87,10 @@ const RendererState = struct {
     surface_sized: bool = false, // Track if surface has been sized at least once
     initial_font_size: u32 = 0, // Initial font size in pixels (0 = use default)
     current_font_size: u32 = 0, // Current font size in pixels (for change detection)
+
+    /// Terminal history budget in bytes, as the host asked for it. Zero means
+    /// the host said nothing, and the library's own budget stands.
+    max_scrollback: usize = 0,
 };
 
 // Map of handle ID -> RendererState
@@ -216,10 +220,11 @@ export fn JNI_OnUnload(vm: *c.JavaVM, reserved: ?*anyopaque) void {
 }
 
 /// Called when OpenGL surface is created
-/// Java signature: void nativeOnSurfaceCreated()
+/// Java signature: void nativeOnSurfaceCreated(long maxScrollbackBytes)
 export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeOnSurfaceCreated(
     env: *c.JNIEnv,
     obj: c.jobject,
+    max_scrollback_bytes: c.jlong,
 ) void {
     var handle = getNativeHandle(env, obj);
 
@@ -285,6 +290,10 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeOnSurfaceCreat
         state.renderer = null;
     }
 
+    // The host's history budget, kept for the renderer built in onSurfaceChanged.
+    // A context that is recreated keeps the budget it was given.
+    state.max_scrollback = if (max_scrollback_bytes > 0) @intCast(max_scrollback_bytes) else 0;
+
     // Reset initialization state so onSurfaceChanged will recreate the renderer
     state.initialized = false;
     state.surface_sized = false;
@@ -333,7 +342,14 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeOnSurfaceChang
         log.info("Initializing renderer for handle {d} with dimensions: {d}x{d} at {d} DPI, font size: {d}px", .{ handle, width, height, dpi, font_size });
 
         const allocator = gpa.allocator();
-        state.renderer = Renderer.init(allocator, @intCast(width), @intCast(height), @intCast(dpi), state.initial_font_size) catch |err| {
+        state.renderer = Renderer.init(
+            allocator,
+            @intCast(width),
+            @intCast(height),
+            @intCast(dpi),
+            state.initial_font_size,
+            if (state.max_scrollback > 0) state.max_scrollback else null,
+        ) catch |err| {
             log.err("Failed to initialize renderer: {}", .{err});
             return;
         };

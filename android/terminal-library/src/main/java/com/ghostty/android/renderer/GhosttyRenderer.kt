@@ -31,7 +31,13 @@ import javax.microedition.khronos.opengles.GL10
  */
 class GhosttyRenderer(
     private val context: Context,
-    initialFontSize: Int
+    initialFontSize: Int,
+    /**
+     * Terminal history budget in bytes. Zero leaves the terminal library's own,
+     * and so does any value below the floor the page list enforces -- which is at
+     * least two of its standard pages, whatever the number says.
+     */
+    private val maxScrollbackBytes: Long = 0,
 ) : GLSurfaceView.Renderer {
 
     // Font size to use when surface is created. Can be updated before surface is ready
@@ -84,7 +90,7 @@ class GhosttyRenderer(
     }
 
     // Native method declarations
-    private external fun nativeOnSurfaceCreated()
+    private external fun nativeOnSurfaceCreated(maxScrollbackBytes: Long)
     private external fun nativeOnSurfaceChanged(width: Int, height: Int, dpi: Int, fontSize: Int)
     private external fun nativeOnDrawFrame()
     private external fun nativeDestroy()
@@ -182,7 +188,7 @@ class GhosttyRenderer(
             Log.d(TAG, "onSurfaceCreated")
 
             try {
-                nativeOnSurfaceCreated()
+                nativeOnSurfaceCreated(maxScrollbackBytes)
             } catch (e: Exception) {
                 Log.e(TAG, "Error in nativeOnSurfaceCreated", e)
                 throw e

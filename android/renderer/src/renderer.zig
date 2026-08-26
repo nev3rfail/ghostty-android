@@ -160,8 +160,17 @@ blink_visible: bool = true,
 preedit_active: bool = false,
 
 /// Initialize the renderer with optional initial dimensions and font size
-/// If initial_font_size_px is 0, uses the default font size
-pub fn init(allocator: std.mem.Allocator, width: u32, height: u32, dpi: u16, initial_font_size_px: u32) !Self {
+/// If initial_font_size_px is 0, uses the default font size.
+/// max_scrollback is the terminal history budget in bytes; null keeps the
+/// library default.
+pub fn init(
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    dpi: u16,
+    initial_font_size_px: u32,
+    max_scrollback: ?usize,
+) !Self {
     log.info("Initializing renderer with dimensions: {d}x{d}, font size: {d}px", .{ width, height, initial_font_size_px });
 
     // Load and compile bg_color shaders
@@ -284,7 +293,12 @@ pub fn init(allocator: std.mem.Allocator, width: u32, height: u32, dpi: u16, ini
     cells_bg_buffer.bindBase(1);
 
     // Initialize terminal manager with calculated dimensions
-    var terminal_manager = try TerminalManager.init(allocator, @intCast(initial_grid_cols), @intCast(initial_grid_rows));
+    var terminal_manager = try TerminalManager.init(
+        allocator,
+        @intCast(initial_grid_cols),
+        @intCast(initial_grid_rows),
+        max_scrollback,
+    );
     errdefer terminal_manager.deinit();
 
     log.info("Terminal manager initialized ({d}x{d})", .{ initial_grid_cols, initial_grid_rows });
