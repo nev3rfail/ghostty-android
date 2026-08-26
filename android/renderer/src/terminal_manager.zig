@@ -233,6 +233,23 @@ pub fn getViewportOffset(self: *TerminalManager) usize {
     return scrollbar.offset;
 }
 
+/// Rows the viewport can travel, above it and below it.
+///
+/// The page list's own scrollbar state is the authority. A viewport offset
+/// alone cannot answer this: it reads as zero both at the top of the buffer and
+/// for a buffer holding no scrollback at all, and those want opposite answers
+/// for travel downwards.
+pub fn getScrollCapacity(self: *TerminalManager) [2]usize {
+    const screen = self.terminal.screens.active;
+    const bar = screen.pages.scrollbar();
+
+    // The offset counts the visible row, so the rows still below the viewport
+    // are what the total holds beyond the visible window. Saturating, because
+    // the three figures are read together but describe a list another thread
+    // may be growing.
+    return .{ bar.offset, bar.total -| bar.offset -| bar.len };
+}
+
 /// Scroll viewport to the bottom (active area)
 pub fn scrollToBottom(self: *TerminalManager) void {
     const screen = self.terminal.screens.active;

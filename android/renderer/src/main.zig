@@ -817,6 +817,51 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetViewportOff
     return 0;
 }
 
+/// Get the rows the viewport can travel, above it and below it
+/// Java signature: int[] nativeGetScrollCapacity()
+/// Returns [above, below] array
+export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetScrollCapacity(
+    env: *c.JNIEnv,
+    obj: c.jobject,
+) c.jintArray {
+    const handle = getNativeHandle(env, obj);
+    const env_vtable = env.*.?;
+
+    const result = env_vtable.*.NewIntArray.?(env, 2);
+    if (result == null) {
+        log.err("Failed to create jintArray for scroll capacity", .{});
+        return null;
+    }
+
+    // Zero is the answer that refuses a gesture, so it is also the answer
+    // every failure gives: a capacity that cannot be read must not read as
+    // room to move.
+    var capacity: [2]c.jint = .{ 0, 0 };
+
+    if (handle == 0) {
+        env_vtable.*.SetIntArrayRegion.?(env, result, 0, 2, &capacity);
+        return result;
+    }
+
+    const state = getRendererState(handle) orelse {
+        env_vtable.*.SetIntArrayRegion.?(env, result, 0, 2, &capacity);
+        return result;
+    };
+
+    if (state.initialized) {
+        if (state.renderer) |*renderer| {
+            const rows = renderer.getScrollCapacity();
+            const limit = std.math.maxInt(c.jint);
+            capacity[0] = @intCast(@min(rows[0], limit));
+            capacity[1] = @intCast(@min(rows[1], limit));
+        }
+    }
+
+    env_vtable.*.SetIntArrayRegion.?(env, result, 0, 2, &capacity);
+
+    return result;
+}
+
 /// Scroll viewport to the bottom (active area)
 /// Java signature: void nativeScrollToBottom()
 export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeScrollToBottom(
@@ -1573,6 +1618,7 @@ comptime {
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeScrollDelta;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeIsViewportAtBottom;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetViewportOffset;
+    _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetScrollCapacity;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeScrollToBottom;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeSetScrollPixelOffset;
     // Ripple effect

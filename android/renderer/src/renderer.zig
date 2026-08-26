@@ -1388,6 +1388,11 @@ pub fn getViewportOffset(self: *Self) usize {
     return self.terminal_manager.getViewportOffset();
 }
 
+/// Rows the viewport can travel, above it and below it
+pub fn getScrollCapacity(self: *Self) [2]usize {
+    return self.terminal_manager.getScrollCapacity();
+}
+
 /// Scroll viewport to the bottom (active area)
 pub fn scrollToBottom(self: *Self) void {
     self.terminal_manager.scrollToBottom();
