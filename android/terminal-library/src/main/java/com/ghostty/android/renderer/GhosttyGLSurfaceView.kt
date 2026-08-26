@@ -236,6 +236,16 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     @Volatile
     private var visualScrollResidual = 0f
 
+    // Where the gesture last touched, in view pixels. Written on the main
+    // thread and read on the GL thread, the way the residual above is, and kept
+    // after the finger leaves so a fling's reports name the same place. A
+    // program that routes the wheel by pane needs the position.
+    @Volatile
+    private var lastTouchX = 0f
+
+    @Volatile
+    private var lastTouchY = 0f
+
     // Two-finger gesture state
     private var twoFingerGestureActive = false
     private var twoFingerStartX1 = 0f
@@ -325,6 +335,23 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
      * otherwise go unnoticed.
      */
     private fun applyScrollPixels(pixels: Float) {
+        // A program drawing its own screen keeps its own history and expects the
+        // wheel. Ask for the bytes before touching the viewport: under such a
+        // program the viewport holds nothing, so moving it is what makes the
+        // gesture read as broken.
+        val wheeled = scrollStep(glScrollPixels + pixels, renderer.getFontLineSpacing())
+        val notches = wheelNotches(wheeled)
+        if (notches != 0) {
+            val report = renderer.encodeWheel(notches, lastTouchX.toInt(), lastTouchY.toInt())
+            if (report != null) {
+                val applied = afterWheel(wheeled)
+                glScrollPixels = applied.residual
+                visualScrollResidual = applied.residual
+                post { eventListener?.onInput(report) }
+                return
+            }
+        }
+
         val available = rowsAvailable(pixels, renderer.getScrollCapacity())
         if (available == 0) {
             // The offset channel is shared with the keyboard overlay's shift, so
@@ -949,6 +976,9 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
             }
             return true
         }
+
+        lastTouchX = event.x
+        lastTouchY = event.y
 
         // Track two-finger gestures
         handleTwoFingerGesture(event)

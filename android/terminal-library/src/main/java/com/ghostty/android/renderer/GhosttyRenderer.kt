@@ -110,6 +110,9 @@ class GhosttyRenderer(
 
     // Scroll capacity native method - returns [above, below]
     private external fun nativeGetScrollCapacity(): IntArray
+
+    // Wheel report native method - returns the bytes, or null when unasked
+    private external fun nativeEncodeWheel(notches: Int, x: Int, y: Int): ByteArray?
     private external fun nativeScrollToBottom()
     private external fun nativeScrollToViewportOffset(row: Int)
     private external fun nativeSetScrollPixelOffset(offset: Float)
@@ -548,6 +551,24 @@ class GhosttyRenderer(
             } catch (e: Exception) {
                 Log.e(TAG, "Error in nativeGetScrollCapacity", e)
                 intArrayOf(0, 0)
+            }
+        }
+    }
+
+    /**
+     * The mouse report the program has asked for, for [notches] wheel notches
+     * at a point in view pixels.
+     *
+     * Negative notches are wheel-up. Null means the program is not asking for
+     * the mouse, which is the signal to move the terminal's own viewport.
+     */
+    fun encodeWheel(notches: Int, x: Int, y: Int): ByteArray? {
+        synchronized(terminalLock) {
+            return try {
+                nativeEncodeWheel(notches, x, y)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeEncodeWheel", e)
+                null
             }
         }
     }

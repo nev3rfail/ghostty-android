@@ -17,7 +17,8 @@ const clock = @import("clock.zig");
 
 /// The blocking Io a mutex parks on. TinyIo is stateless and zero-sized, and
 /// its futex operations are all a mutex asks for.
-const tiny_io: std.Io = @import("ghostty-vt").TinyIo.init.io();
+const ghostty_vt = @import("ghostty-vt");
+const tiny_io: std.Io = ghostty_vt.TinyIo.init.io();
 
 const log = std.log.scoped(.renderer);
 
@@ -1391,6 +1392,62 @@ pub fn getViewportOffset(self: *Self) usize {
 /// Rows the viewport can travel, above it and below it
 pub fn getScrollCapacity(self: *Self) [2]usize {
     return self.terminal_manager.getScrollCapacity();
+}
+
+/// The mouse report a program has asked for, for `notches` wheel notches at a
+/// point in surface pixels.
+///
+/// Negative notches are wheel-up. Answers null when the program is not asking
+/// for the mouse, which is the signal to move the terminal's own viewport
+/// instead. The wire format is the vt library's; what happens here is the mode
+/// read and the geometry, and both are read beside the encode so the three
+/// cannot disagree.
+pub fn encodeWheel(
+    self: *Self,
+    buf: []u8,
+    notches: i32,
+    x: f32,
+    y: f32,
+) ?usize {
+    if (notches == 0) return null;
+
+    const terminal = self.terminal_manager.getTerminal();
+    if (terminal.flags.mouse_event == .none) return null;
+
+    const cell_size = self.font_system.getCellSize();
+    if (cell_size[0] <= 0 or cell_size[1] <= 0) return null;
+
+    // A notch is a press of button four upwards or five downwards, and a wheel
+    // press is never paired with a release, so the pressed-button flag is what
+    // keeps a report outside the viewport from being dropped.
+    const opts: ghostty_vt.input.MouseEncodeOptions = .{
+        .event = terminal.flags.mouse_event,
+        .format = terminal.flags.mouse_format,
+        .size = .{
+            .screen = .{ .width = self.width, .height = self.height },
+            .cell = .{
+                .width = @intFromFloat(cell_size[0]),
+                .height = @intFromFloat(cell_size[1]),
+            },
+            .padding = .{},
+        },
+        .any_button_pressed = true,
+    };
+
+    const event: ghostty_vt.input.MouseEncodeEvent = .{
+        .action = .press,
+        .button = if (notches < 0) .four else .five,
+        .pos = .{ .x = x, .y = y },
+    };
+
+    var writer = std.Io.Writer.fixed(buf);
+    const count: usize = @abs(notches);
+    for (0..count) |_| {
+        ghostty_vt.input.encodeMouse(&writer, event, opts) catch break;
+    }
+
+    const written = writer.buffered().len;
+    return if (written == 0) null else written;
 }
 
 /// Scroll viewport to the bottom (active area)

@@ -58,6 +58,24 @@ fun rowsAvailable(pixels: Float, capacity: IntArray): Int {
 }
 
 /**
+ * The wheel notches a step asks the program for.
+ *
+ * A notch is one cell row, so the row delta is the notch count: negative is
+ * wheel-up, matching travel towards the older end of the buffer.
+ */
+fun wheelNotches(step: ScrollStep): Int = step.rows
+
+/**
+ * What a frame's travel does when the program is holding the wheel.
+ *
+ * Bytes went to the program, so the viewport does not move and the remainder
+ * stays: travel smaller than a row is not lost, it accumulates until it is
+ * worth a notch. Nothing is drawn as a sub-row shift, because an offset
+ * without a viewport movement shears the frame.
+ */
+fun afterWheel(step: ScrollStep): ScrollStep = ScrollStep(0, step.residual)
+
+/**
  * What survives of a step the viewport refused.
  *
  * [rowsMoved] is the movement measured either side of applying the delta, which

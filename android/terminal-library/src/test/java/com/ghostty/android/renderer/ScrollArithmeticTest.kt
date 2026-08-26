@@ -141,6 +141,37 @@ class ScrollArithmeticTest {
         }
     }
 
+    @Test
+    fun `a notch is a row, and up is negative`() {
+        assertEquals(-3, wheelNotches(ScrollStep(rows = -3, residual = 4f)))
+        assertEquals(2, wheelNotches(ScrollStep(rows = 2, residual = 4f)))
+        assertEquals(0, wheelNotches(ScrollStep.None))
+    }
+
+    @Test
+    fun `travel given to the program moves no viewport and keeps its remainder`() {
+        val step = ScrollStep(rows = -3, residual = 11f)
+        val applied = afterWheel(step)
+        assertEquals(0, applied.rows)
+        assertEquals(11f, applied.residual, EPSILON)
+    }
+
+    @Test
+    fun `a frame's travel asks for one report, not one per row`() {
+        // Several rows crossed inside a frame is one notch count, so the program
+        // is woken once rather than once per row.
+        val step = scrollStep(accumulatedPixels = 5 * CELL + 3f, cellHeight = CELL)
+        assertEquals(5, wheelNotches(step))
+    }
+
+    @Test
+    fun `sub-row travel asks the program for nothing yet`() {
+        val step = scrollStep(accumulatedPixels = CELL / 3f, cellHeight = CELL)
+        assertEquals(0, wheelNotches(step))
+        // and the remainder survives, so the next frame can reach a notch
+        assertEquals(CELL / 3f, afterWheel(step).residual, EPSILON)
+    }
+
     private companion object {
         const val CELL = 24f
         const val EPSILON = 0.001f

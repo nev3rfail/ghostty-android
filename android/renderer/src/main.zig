@@ -862,6 +862,53 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetScrollCapac
     return result;
 }
 
+/// Encode wheel notches as the mouse report the program has asked for
+/// Java signature: byte[] nativeEncodeWheel(int notches, int x, int y)
+/// Returns the bytes to write to the pty, or null when the program is not
+/// asking for the mouse
+export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeEncodeWheel(
+    env: *c.JNIEnv,
+    obj: c.jobject,
+    notches: c.jint,
+    x: c.jint,
+    y: c.jint,
+) c.jbyteArray {
+    const handle = getNativeHandle(env, obj);
+    if (handle == 0) return null;
+
+    const state = getRendererState(handle) orelse return null;
+    if (!state.initialized) return null;
+
+    const renderer = if (state.renderer) |*r| r else return null;
+
+    // One frame's notches, and a report is a handful of bytes even in the
+    // longest format, so the buffer is a local rather than an allocation.
+    var buf: [256]u8 = undefined;
+    const written = renderer.encodeWheel(
+        &buf,
+        @intCast(notches),
+        @floatFromInt(x),
+        @floatFromInt(y),
+    ) orelse return null;
+
+    const env_vtable = env.*.?;
+    const result = env_vtable.*.NewByteArray.?(env, @intCast(written));
+    if (result == null) {
+        log.err("Failed to create jbyteArray for wheel report", .{});
+        return null;
+    }
+
+    env_vtable.*.SetByteArrayRegion.?(
+        env,
+        result,
+        0,
+        @intCast(written),
+        @ptrCast(&buf),
+    );
+
+    return result;
+}
+
 /// Scroll viewport to the bottom (active area)
 /// Java signature: void nativeScrollToBottom()
 export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeScrollToBottom(
@@ -1619,6 +1666,7 @@ comptime {
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeIsViewportAtBottom;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetViewportOffset;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeGetScrollCapacity;
+    _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeEncodeWheel;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeScrollToBottom;
     _ = Java_com_ghostty_android_renderer_GhosttyRenderer_nativeSetScrollPixelOffset;
     // Ripple effect
