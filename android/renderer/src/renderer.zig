@@ -13,6 +13,11 @@ const DynamicFontSystem = @import("dynamic_font_system.zig").DynamicFontSystem;
 const font_metrics = @import("font_metrics.zig");
 const TerminalManager = @import("terminal_manager.zig");
 const screen_extractor = @import("screen_extractor.zig");
+const clock = @import("clock.zig");
+
+/// The blocking Io a mutex parks on. TinyIo is stateless and zero-sized, and
+/// its futex operations are all a mutex asks for.
+const tiny_io: std.Io = @import("ghostty-vt").TinyIo.init.io();
 
 const log = std.log.scoped(.renderer);
 
@@ -42,7 +47,7 @@ terminal_manager: TerminalManager,
 
 /// Mutex for thread-safe access to terminal_manager
 /// Allows processInput to be called from any thread while render runs on GL thread
-terminal_mutex: std.Thread.Mutex = .{},
+terminal_mutex: std.Io.Mutex = .init,
 
 /// Surface dimensions in pixels
 width: u32 = 0,
@@ -718,7 +723,7 @@ pub fn hasActiveAnimation(self: *const Self) bool {
 /// Render a frame
 pub fn render(self: *Self) !void {
     // Update FPS counter
-    const now: i64 = @truncate(std.time.nanoTimestamp());
+    const now: i64 = clock.nowNanos();
     self.frame_count += 1;
 
     // Frame timing diagnostics - measure time since last render
@@ -790,9 +795,9 @@ pub fn render(self: *Self) !void {
     // We still render the existing buffers to avoid visual freeze.
     if (!self.terminal_manager.isSynchronizedOutputActive()) {
         // Sync renderer state from terminal (extract cells and update GPU buffers)
-        const sync_start: i64 = @truncate(std.time.nanoTimestamp());
+        const sync_start: i64 = clock.nowNanos();
         try self.syncFromTerminal();
-        const sync_end: i64 = @truncate(std.time.nanoTimestamp());
+        const sync_end: i64 = clock.nowNanos();
         self.sync_time_ns = sync_end - sync_start;
     }
 
@@ -1128,16 +1133,16 @@ pub fn updateFontSize(self: *Self, new_font_size: u32) !void {
 /// Can be called from any thread - will acquire mutex and process input.
 /// Note: This does NOT sync to GPU - that happens in the render loop.
 pub fn processInput(self: *Self, data: []const u8) !void {
-    self.terminal_mutex.lock();
-    defer self.terminal_mutex.unlock();
+    self.terminal_mutex.lockUncancelable(tiny_io);
+    defer self.terminal_mutex.unlock(tiny_io);
     try self.terminal_manager.processInput(data);
 }
 
 /// Update renderer buffers from terminal state (thread-safe).
 /// Called from the GL render loop.
 pub fn syncFromTerminal(self: *Self) !void {
-    self.terminal_mutex.lock();
-    defer self.terminal_mutex.unlock();
+    self.terminal_mutex.lockUncancelable(tiny_io);
+    defer self.terminal_mutex.unlock(tiny_io);
 
     // Extract cell data from terminal
     const cells = try screen_extractor.extractCells(
@@ -1336,9 +1341,9 @@ pub fn processTerminalInput(self: *Self, data: []const u8) !void {
     // If the input contained ESC[?2026l (end sync), the mode will be off now,
     // and we'll sync the complete batched state.
     // Note: This check is safe because render loop also checks before syncing.
-    self.terminal_mutex.lock();
+    self.terminal_mutex.lockUncancelable(tiny_io);
     const sync_active = self.terminal_manager.isSynchronizedOutputActive();
-    self.terminal_mutex.unlock();
+    self.terminal_mutex.unlock(tiny_io);
 
     if (!sync_active) {
         try self.syncFromTerminal();
@@ -1449,7 +1454,7 @@ pub fn setShowFps(self: *Self, show: bool) void {
 
 /// Set the microphone indicator state
 pub fn setMicIndicatorState(self: *Self, state: u8) void {
-    const new_state = std.meta.intToEnum(MicIndicatorState, state) catch .off;
+    const new_state = std.enums.fromInt(MicIndicatorState, state) orelse .off;
     log.info("setMicIndicatorState: {} -> {}", .{ self.mic_indicator_state, new_state });
     self.mic_indicator_state = new_state;
     // Reset pulse animation when state changes to active or processing
@@ -1659,7 +1664,7 @@ pub fn startRipple(self: *Self, center_x: f32, center_y: f32, max_radius: f32) v
     self.uniforms.ripple_center = .{ center_x, center_y };
     self.uniforms.ripple_max_radius = max_radius;
     self.uniforms.ripple_progress = 0.0;
-    self.ripple_start_time_ns = @truncate(std.time.nanoTimestamp());
+    self.ripple_start_time_ns = clock.nowNanos();
 }
 
 /// Update the ripple animation progress.
@@ -1685,7 +1690,7 @@ pub const SweepDirection = enum(u32) {
 pub fn startSweep(self: *Self, direction: u32) void {
     self.uniforms.sweep_direction = direction;
     self.uniforms.sweep_progress = 0.0;
-    self.sweep_start_time_ns = @truncate(std.time.nanoTimestamp());
+    self.sweep_start_time_ns = clock.nowNanos();
 }
 
 /// Update the sweep animation progress.

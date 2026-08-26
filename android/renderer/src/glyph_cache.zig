@@ -233,7 +233,9 @@ pub const GlyphCache = struct {
 
         // Access glyph slot through handle
         const glyph = face.face.handle.*.glyph;
-        const bitmap = &glyph.*.bitmap;
+        // Read by value: taking the address of a field reached through a C
+        // pointer yields another C pointer, which carries no field access.
+        const bitmap = glyph.*.bitmap;
 
         // Determine format based on bitmap mode
         // FreeType pixel modes: FT_PIXEL_MODE_GRAY = 2, FT_PIXEL_MODE_BGRA = 7

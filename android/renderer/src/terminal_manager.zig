@@ -9,6 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const cursor_style = @import("cursor_style.zig");
+const clock = @import("clock.zig");
 
 const log = std.log.scoped(.terminal_manager);
 
@@ -354,7 +355,7 @@ pub fn isSynchronizedOutputActive(self: *TerminalManager) bool {
         return false;
     }
 
-    const now = std.time.milliTimestamp();
+    const now = clock.nowMillis();
     const started = self.sync_started_ms orelse {
         self.sync_started_ms = now;
         return true;

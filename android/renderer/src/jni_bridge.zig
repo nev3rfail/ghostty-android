@@ -4,9 +4,7 @@
 ///! from Zig code.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("jni.h");
-});
+const c = @import("c.zig").c;
 
 /// Convert a JNI jstring to a Zig slice
 /// Caller must call releaseJString when done
