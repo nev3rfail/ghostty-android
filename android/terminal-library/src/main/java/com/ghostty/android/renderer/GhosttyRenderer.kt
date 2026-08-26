@@ -12,6 +12,20 @@ import javax.microedition.khronos.opengles.GL10
  * This class implements the GLSurfaceView.Renderer interface and delegates
  * all rendering operations to the native Zig renderer via JNI.
  *
+ * Three threads reach the terminal behind this class: the thread reading the
+ * process output, the GL thread drawing frames, and the main thread carrying
+ * gestures and lifecycle calls. Every method here that reaches terminal state
+ * holds `terminalLock` while it does, which is what keeps a frame from being
+ * built out of a page list another thread is rewriting.
+ *
+ * The list stays exhaustive because every native declaration in this class is
+ * private: the only route to the terminal is a method in this file. A new
+ * external declaration arrives with the method that locks it.
+ *
+ * [onDrawFrame] is deliberately outside the lock. The native renderer holds its
+ * own mutex against the output thread, and the GL thread is the only thread
+ * that draws, so a frame needs nothing from this one.
+ *
  * @param context Android context for accessing display metrics
  * @param initialFontSize Initial font size in pixels. Required - caller must provide a valid size.
  */
@@ -41,6 +55,17 @@ class GhosttyRenderer(
      */
     @JvmField
     var nativeHandle: Long = 0
+
+    /**
+     * Serializes every route to terminal state.
+     *
+     * A private object rather than this instance: the monitor of a public class
+     * can be taken by anything holding a reference to it, and the ordering this
+     * lock relies on assumes nothing else can. It is always taken before the
+     * native renderer's own mutex, because it is taken on the way into a native
+     * call and never inside one.
+     */
+    private val terminalLock = Any()
 
     companion object {
         private const val TAG = "GhosttyRenderer"
@@ -124,6 +149,10 @@ class GhosttyRenderer(
     /**
      * Set callback to be invoked after onSurfaceChanged completes.
      * Called with the new grid dimensions on the GL thread.
+     *
+     * It runs while the terminal lock is held, so it must neither call back into
+     * this renderer nor block: the ordering that keeps the lock deadlock-free
+     * assumes no thread holding it waits on another.
      */
     fun setOnSurfaceChangedCallback(callback: ((cols: Int, rows: Int) -> Unit)?) {
         this.onSurfaceChangedCallback = callback
@@ -149,13 +178,15 @@ class GhosttyRenderer(
      * the app returns from the background).
      */
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        Log.d(TAG, "onSurfaceCreated")
+        synchronized(terminalLock) {
+            Log.d(TAG, "onSurfaceCreated")
 
-        try {
-            nativeOnSurfaceCreated()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeOnSurfaceCreated", e)
-            throw e
+            try {
+                nativeOnSurfaceCreated()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeOnSurfaceCreated", e)
+                throw e
+            }
         }
     }
 
@@ -170,45 +201,47 @@ class GhosttyRenderer(
      * @param height The new surface height in pixels
      */
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
-        // Get the display density (DPI) from Android
-        val displayMetrics = context.resources.displayMetrics
-        val dpi = displayMetrics.densityDpi // This is an integer DPI value
+        synchronized(terminalLock) {
+            // Get the display density (DPI) from Android
+            val displayMetrics = context.resources.displayMetrics
+            val dpi = displayMetrics.densityDpi // This is an integer DPI value
 
-        Log.d(TAG, "onSurfaceChanged: ${width}x${height} at $dpi DPI, font size: $pendingFontSize")
+            Log.d(TAG, "onSurfaceChanged: ${width}x${height} at $dpi DPI, font size: $pendingFontSize")
 
-        // Store dimensions for later use (e.g., font size changes)
-        lastSurfaceWidth = width
-        lastSurfaceHeight = height
-        lastDpi = dpi
+            // Store dimensions for later use (e.g., font size changes)
+            lastSurfaceWidth = width
+            lastSurfaceHeight = height
+            lastDpi = dpi
 
-        try {
-            // Save scroll position BEFORE resize (for orientation change preservation)
-            // This is a no-op if renderer not initialized yet or viewport is at bottom
-            nativeSaveViewportAnchor()
+            try {
+                // Save scroll position BEFORE resize (for orientation change preservation)
+                // This is a no-op if renderer not initialized yet or viewport is at bottom
+                nativeSaveViewportAnchor()
 
-            nativeOnSurfaceChanged(width, height, dpi, pendingFontSize)
+                nativeOnSurfaceChanged(width, height, dpi, pendingFontSize)
 
-            // Restore scroll position AFTER resize
-            nativeRestoreViewportAnchor()
+                // Restore scroll position AFTER resize
+                nativeRestoreViewportAnchor()
 
-            // Get grid size and notify callback only if size changed
-            val gridSize = getGridSize()
-            val cols = gridSize[0]
-            val rows = gridSize[1]
-            if (cols > 0 && rows > 0) {
-                val sizeChanged = cols != lastGridCols || rows != lastGridRows
-                Log.d(TAG, "Surface ready with grid size: ${cols}x${rows}, changed=$sizeChanged")
-                // Update tracking
-                lastGridCols = cols
-                lastGridRows = rows
-                // Only notify callback if size actually changed
-                if (sizeChanged) {
-                    onSurfaceChangedCallback?.invoke(cols, rows)
+                // Get grid size and notify callback only if size changed
+                val gridSize = getGridSize()
+                val cols = gridSize[0]
+                val rows = gridSize[1]
+                if (cols > 0 && rows > 0) {
+                    val sizeChanged = cols != lastGridCols || rows != lastGridRows
+                    Log.d(TAG, "Surface ready with grid size: ${cols}x${rows}, changed=$sizeChanged")
+                    // Update tracking
+                    lastGridCols = cols
+                    lastGridRows = rows
+                    // Only notify callback if size actually changed
+                    if (sizeChanged) {
+                        onSurfaceChangedCallback?.invoke(cols, rows)
+                    }
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeOnSurfaceChanged", e)
+                throw e
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeOnSurfaceChanged", e)
-            throw e
         }
     }
 
@@ -249,12 +282,14 @@ class GhosttyRenderer(
      * Should be called on the GL thread.
      */
     fun destroy() {
-        Log.d(TAG, "destroy")
+        synchronized(terminalLock) {
+            Log.d(TAG, "destroy")
 
-        try {
-            nativeDestroy()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeDestroy", e)
+            try {
+                nativeDestroy()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeDestroy", e)
+            }
         }
     }
 
@@ -265,12 +300,14 @@ class GhosttyRenderer(
      * @param rows Number of rows
      */
     fun setTerminalSize(cols: Int, rows: Int) {
-        Log.d(TAG, "setTerminalSize: ${cols}x${rows}")
+        synchronized(terminalLock) {
+            Log.d(TAG, "setTerminalSize: ${cols}x${rows}")
 
-        try {
-            nativeSetTerminalSize(cols, rows)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeSetTerminalSize", e)
+            try {
+                nativeSetTerminalSize(cols, rows)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeSetTerminalSize", e)
+            }
         }
     }
 
@@ -278,16 +315,20 @@ class GhosttyRenderer(
      * Called when the render thread is paused.
      */
     fun onPause() {
-        Log.d(TAG, "onPause")
-        // Future: Could pause background work here
+        synchronized(terminalLock) {
+            Log.d(TAG, "onPause")
+            // Future: Could pause background work here
+        }
     }
 
     /**
      * Called when the render thread is resumed.
      */
     fun onResume() {
-        Log.d(TAG, "onResume")
-        // Future: Could resume background work here
+        synchronized(terminalLock) {
+            Log.d(TAG, "onResume")
+            // Future: Could resume background work here
+        }
     }
 
     /**
@@ -300,43 +341,45 @@ class GhosttyRenderer(
      * @param fontSize Font size in pixels
      */
     fun setFontSize(fontSize: Int) {
-        Log.i(TAG, "setFontSize: $fontSize")
+        synchronized(terminalLock) {
+            Log.i(TAG, "setFontSize: $fontSize")
 
-        // Need surface dimensions to recalculate grid
-        if (lastSurfaceWidth == 0 || lastSurfaceHeight == 0) {
-            Log.w(TAG, "setFontSize called before surface is ready, updating pending font size")
-            pendingFontSize = fontSize
-            return
-        }
-
-        try {
-            // Save scroll position BEFORE font size change (preserves position across reflow)
-            nativeSaveViewportAnchor()
-
-            // Call nativeOnSurfaceChanged with new font size to trigger full recalculation
-            // This ensures grid dimensions are updated based on new font metrics
-            nativeOnSurfaceChanged(lastSurfaceWidth, lastSurfaceHeight, lastDpi, fontSize)
-
-            // Restore scroll position AFTER font size change
-            nativeRestoreViewportAnchor()
-
-            // Get the new grid size after recalculation
-            val gridSize = getGridSize()
-            val cols = gridSize[0]
-            val rows = gridSize[1]
-            if (cols > 0 && rows > 0) {
-                // Skip callback if grid size hasn't changed (avoids duplicate resize events)
-                if (cols == lastGridCols && rows == lastGridRows) {
-                    Log.d(TAG, "Font size set, grid unchanged: ${cols}x${rows} - skipping callback")
-                    return
-                }
-                Log.d(TAG, "Font size changed, new grid: ${cols}x${rows}")
-                lastGridCols = cols
-                lastGridRows = rows
-                onSurfaceChangedCallback?.invoke(cols, rows)
+            // Need surface dimensions to recalculate grid
+            if (lastSurfaceWidth == 0 || lastSurfaceHeight == 0) {
+                Log.w(TAG, "setFontSize called before surface is ready, updating pending font size")
+                pendingFontSize = fontSize
+                return
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in setFontSize", e)
+
+            try {
+                // Save scroll position BEFORE font size change (preserves position across reflow)
+                nativeSaveViewportAnchor()
+
+                // Call nativeOnSurfaceChanged with new font size to trigger full recalculation
+                // This ensures grid dimensions are updated based on new font metrics
+                nativeOnSurfaceChanged(lastSurfaceWidth, lastSurfaceHeight, lastDpi, fontSize)
+
+                // Restore scroll position AFTER font size change
+                nativeRestoreViewportAnchor()
+
+                // Get the new grid size after recalculation
+                val gridSize = getGridSize()
+                val cols = gridSize[0]
+                val rows = gridSize[1]
+                if (cols > 0 && rows > 0) {
+                    // Skip callback if grid size hasn't changed (avoids duplicate resize events)
+                    if (cols == lastGridCols && rows == lastGridRows) {
+                        Log.d(TAG, "Font size set, grid unchanged: ${cols}x${rows} - skipping callback")
+                        return
+                    }
+                    Log.d(TAG, "Font size changed, new grid: ${cols}x${rows}")
+                    lastGridCols = cols
+                    lastGridRows = rows
+                    onSurfaceChangedCallback?.invoke(cols, rows)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in setFontSize", e)
+            }
         }
     }
 
@@ -349,13 +392,15 @@ class GhosttyRenderer(
      * @param ansiSequence The ANSI escape sequence string to process
      */
     fun processInput(ansiSequence: String) {
-        Log.d(TAG, "processInput: ${ansiSequence.length} bytes")
+        synchronized(terminalLock) {
+            Log.d(TAG, "processInput: ${ansiSequence.length} bytes")
 
-        try {
-            nativeProcessInput(ansiSequence)
-            renderRequester?.invoke()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeProcessInput", e)
+            try {
+                nativeProcessInput(ansiSequence)
+                renderRequester?.invoke()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeProcessInput", e)
+            }
         }
     }
 
@@ -370,11 +415,13 @@ class GhosttyRenderer(
      * @param length Number of valid bytes at the start of the buffer
      */
     fun processInput(bytes: ByteArray, length: Int) {
-        try {
-            nativeProcessInputBytes(bytes, length)
-            renderRequester?.invoke()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeProcessInputBytes", e)
+        synchronized(terminalLock) {
+            try {
+                nativeProcessInputBytes(bytes, length)
+                renderRequester?.invoke()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeProcessInputBytes", e)
+            }
         }
     }
 
@@ -388,11 +435,13 @@ class GhosttyRenderer(
      * @return Number of rows above the active area that can be scrolled to
      */
     fun getScrollbackRows(): Int {
-        return try {
-            nativeGetScrollbackRows()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetScrollbackRows", e)
-            0
+        synchronized(terminalLock) {
+            return try {
+                nativeGetScrollbackRows()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetScrollbackRows", e)
+                0
+            }
         }
     }
 
@@ -402,11 +451,13 @@ class GhosttyRenderer(
      * @return Cell height in pixels
      */
     fun getFontLineSpacing(): Float {
-        return try {
-            nativeGetFontLineSpacing()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetFontLineSpacing", e)
-            20f
+        synchronized(terminalLock) {
+            return try {
+                nativeGetFontLineSpacing()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetFontLineSpacing", e)
+                20f
+            }
         }
     }
 
@@ -416,11 +467,13 @@ class GhosttyRenderer(
      * @return Content height in pixels based on cursor position
      */
     fun getContentHeight(): Float {
-        return try {
-            nativeGetContentHeight()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetContentHeight", e)
-            0f
+        synchronized(terminalLock) {
+            return try {
+                nativeGetContentHeight()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetContentHeight", e)
+                0f
+            }
         }
     }
 
@@ -433,10 +486,12 @@ class GhosttyRenderer(
      * @param delta Number of rows to scroll (positive = down, negative = up)
      */
     fun scrollDelta(delta: Int) {
-        try {
-            nativeScrollDelta(delta)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeScrollDelta", e)
+        synchronized(terminalLock) {
+            try {
+                nativeScrollDelta(delta)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeScrollDelta", e)
+            }
         }
     }
 
@@ -446,11 +501,13 @@ class GhosttyRenderer(
      * @return true if at bottom, false if scrolled up
      */
     fun isViewportAtBottom(): Boolean {
-        return try {
-            nativeIsViewportAtBottom()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeIsViewportAtBottom", e)
-            true
+        synchronized(terminalLock) {
+            return try {
+                nativeIsViewportAtBottom()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeIsViewportAtBottom", e)
+                true
+            }
         }
     }
 
@@ -460,11 +517,13 @@ class GhosttyRenderer(
      * @return Offset in rows (0 = at top of scrollback)
      */
     fun getViewportOffset(): Int {
-        return try {
-            nativeGetViewportOffset()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetViewportOffset", e)
-            0
+        synchronized(terminalLock) {
+            return try {
+                nativeGetViewportOffset()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetViewportOffset", e)
+                0
+            }
         }
     }
 
@@ -473,12 +532,14 @@ class GhosttyRenderer(
      * Also resets the visual scroll pixel offset to 0.
      */
     fun scrollToBottom() {
-        try {
-            nativeScrollToBottom()
-            // Also reset the visual scroll pixel offset
-            nativeSetScrollPixelOffset(0f)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeScrollToBottom", e)
+        synchronized(terminalLock) {
+            try {
+                nativeScrollToBottom()
+                // Also reset the visual scroll pixel offset
+                nativeSetScrollPixelOffset(0f)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeScrollToBottom", e)
+            }
         }
     }
 
@@ -492,12 +553,14 @@ class GhosttyRenderer(
      * @param row The absolute row offset to scroll to (0 = top of scrollback)
      */
     fun scrollToViewportOffset(row: Int) {
-        try {
-            nativeScrollToViewportOffset(row)
-            // Reset the visual scroll pixel offset for clean position
-            nativeSetScrollPixelOffset(0f)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeScrollToViewportOffset", e)
+        synchronized(terminalLock) {
+            try {
+                nativeScrollToViewportOffset(row)
+                // Reset the visual scroll pixel offset for clean position
+                nativeSetScrollPixelOffset(0f)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeScrollToViewportOffset", e)
+            }
         }
     }
 
@@ -511,10 +574,12 @@ class GhosttyRenderer(
      * @param offset Pixel offset for sub-row scrolling
      */
     fun setScrollPixelOffset(offset: Float) {
-        try {
-            nativeSetScrollPixelOffset(offset)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeSetScrollPixelOffset", e)
+        synchronized(terminalLock) {
+            try {
+                nativeSetScrollPixelOffset(offset)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeSetScrollPixelOffset", e)
+            }
         }
     }
 
@@ -524,10 +589,12 @@ class GhosttyRenderer(
      * If the viewport is at the bottom, no anchor is saved (we want to stay at bottom).
      */
     fun saveViewportAnchor() {
-        try {
-            nativeSaveViewportAnchor()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeSaveViewportAnchor", e)
+        synchronized(terminalLock) {
+            try {
+                nativeSaveViewportAnchor()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeSaveViewportAnchor", e)
+            }
         }
     }
 
@@ -536,15 +603,21 @@ class GhosttyRenderer(
      * Call this AFTER resize operations. The saved anchor is cleared after restoration.
      */
     fun restoreViewportAnchor() {
-        try {
-            nativeRestoreViewportAnchor()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeRestoreViewportAnchor", e)
+        synchronized(terminalLock) {
+            try {
+                nativeRestoreViewportAnchor()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeRestoreViewportAnchor", e)
+            }
         }
     }
 
     // ============================================================================
     // Ripple Effect API
+    //
+    // The effects below set shader uniforms and reach no terminal state, so they
+    // take no lock. The rule the rest of the class follows is that a method
+    // reaching terminal state holds terminalLock; these have nothing to reach.
     // ============================================================================
 
     /**
@@ -618,11 +691,13 @@ class GhosttyRenderer(
      * @return IntArray of [cols, rows], or [0, 0] if not available
      */
     fun getGridSize(): IntArray {
-        return try {
-            nativeGetGridSize()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetGridSize", e)
-            intArrayOf(0, 0)
+        synchronized(terminalLock) {
+            return try {
+                nativeGetGridSize()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetGridSize", e)
+                intArrayOf(0, 0)
+            }
         }
     }
 
@@ -697,11 +772,13 @@ class GhosttyRenderer(
      * @return FloatArray of [cellWidth, cellHeight] in pixels, or [0, 0] if not available
      */
     fun getCellSize(): FloatArray {
-        return try {
-            nativeGetCellSize()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetCellSize", e)
-            floatArrayOf(0f, 0f)
+        synchronized(terminalLock) {
+            return try {
+                nativeGetCellSize()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetCellSize", e)
+                floatArrayOf(0f, 0f)
+            }
         }
     }
 
@@ -712,10 +789,12 @@ class GhosttyRenderer(
      * @param row Row index (0-based, in viewport coordinates)
      */
     fun startSelection(col: Int, row: Int) {
-        try {
-            nativeStartSelection(col, row)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeStartSelection", e)
+        synchronized(terminalLock) {
+            try {
+                nativeStartSelection(col, row)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeStartSelection", e)
+            }
         }
     }
 
@@ -726,10 +805,12 @@ class GhosttyRenderer(
      * @param row Row index (0-based, in viewport coordinates)
      */
     fun updateSelection(col: Int, row: Int) {
-        try {
-            nativeUpdateSelection(col, row)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeUpdateSelection", e)
+        synchronized(terminalLock) {
+            try {
+                nativeUpdateSelection(col, row)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeUpdateSelection", e)
+            }
         }
     }
 
@@ -737,10 +818,12 @@ class GhosttyRenderer(
      * Clear the current selection.
      */
     fun clearSelection() {
-        try {
-            nativeClearSelection()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeClearSelection", e)
+        synchronized(terminalLock) {
+            try {
+                nativeClearSelection()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeClearSelection", e)
+            }
         }
     }
 
@@ -750,11 +833,13 @@ class GhosttyRenderer(
      * @return true if a selection exists, false otherwise
      */
     fun hasSelection(): Boolean {
-        return try {
-            nativeHasSelection()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeHasSelection", e)
-            false
+        synchronized(terminalLock) {
+            return try {
+                nativeHasSelection()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeHasSelection", e)
+                false
+            }
         }
     }
 
@@ -764,11 +849,13 @@ class GhosttyRenderer(
      * @return The selected text, or null if no selection exists
      */
     fun getSelectionText(): String? {
-        return try {
-            nativeGetSelectionText()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetSelectionText", e)
-            null
+        synchronized(terminalLock) {
+            return try {
+                nativeGetSelectionText()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetSelectionText", e)
+                null
+            }
         }
     }
 
@@ -778,11 +865,13 @@ class GhosttyRenderer(
      * @return IntArray of [startCol, startRow, endCol, endRow], or null if no selection
      */
     fun getSelectionBounds(): IntArray? {
-        return try {
-            nativeGetSelectionBounds()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetSelectionBounds", e)
-            null
+        synchronized(terminalLock) {
+            return try {
+                nativeGetSelectionBounds()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetSelectionBounds", e)
+                null
+            }
         }
     }
 
@@ -802,20 +891,24 @@ class GhosttyRenderer(
      * if none has since the last call. Consumers poll this after feeding output.
      */
     fun takeClipboardWrite(): String? {
-        return try {
-            nativeTakeClipboardWrite()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeTakeClipboardWrite", e)
-            null
+        synchronized(terminalLock) {
+            return try {
+                nativeTakeClipboardWrite()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeTakeClipboardWrite", e)
+                null
+            }
         }
     }
 
     fun getHyperlinkAtCell(col: Int, row: Int): String? {
-        return try {
-            nativeGetHyperlinkAtCell(col, row)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in nativeGetHyperlinkAtCell", e)
-            null
+        synchronized(terminalLock) {
+            return try {
+                nativeGetHyperlinkAtCell(col, row)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in nativeGetHyperlinkAtCell", e)
+                null
+            }
         }
     }
 
@@ -833,11 +926,13 @@ class GhosttyRenderer(
      * @return The visible viewport text with SGR sequences, or null if unable to extract
      */
     fun getViewportText(): String? {
-        return try {
-            nativeGetViewportTextVT()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in getViewportText", e)
-            null
+        synchronized(terminalLock) {
+            return try {
+                nativeGetViewportTextVT()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in getViewportText", e)
+                null
+            }
         }
     }
 }
