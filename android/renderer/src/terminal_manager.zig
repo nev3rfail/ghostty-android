@@ -12,39 +12,6 @@ const cursor_style = @import("cursor_style.zig");
 
 const log = std.log.scoped(.terminal_manager);
 
-/// The terminal's own handler, named here because the vt module does not export
-/// it even though it exports the stream that takes one.
-const ReadonlyHandler = @TypeOf(@as(*ghostty_vt.Terminal, undefined).vtHandler());
-
-/// The stream's handler: the terminal's own, plus the commands it deliberately
-/// ignores that this app has a use for.
-///
-/// OSC 52 is the one. A program asking for text on the clipboard changes no
-/// terminal state, so the terminal's handler drops it, and there is no other
-/// way for a program to reach the system clipboard.
-const Handler = struct {
-    inner: ReadonlyHandler,
-    manager: *TerminalManager,
-
-    pub fn deinit(self: *Handler) void {
-        self.inner.deinit();
-    }
-
-    pub fn vt(
-        self: *Handler,
-        comptime action: ghostty_vt.StreamAction.Tag,
-        value: ghostty_vt.StreamAction.Value(action),
-    ) !void {
-        switch (action) {
-            .clipboard_contents => self.manager.clipboardWritten(value.kind, value.data),
-            else => {},
-        }
-        return self.inner.vt(action, value);
-    }
-};
-
-const VtStream = ghostty_vt.Stream(Handler);
-
 /// Terminal Manager manages a VT terminal instance
 pub const TerminalManager = @This();
 
@@ -63,7 +30,7 @@ render_state: ghostty_vt.RenderState = .empty,
 ///
 /// Built on first use rather than in init, because it holds a pointer to the
 /// terminal and init returns by value.
-stream: ?VtStream = null,
+stream: ?ghostty_vt.TerminalStream = null,
 
 /// When the current synchronized update began, for bounding how long it holds
 /// the screen. Null while no update is in progress.
@@ -140,33 +107,41 @@ pub fn deinit(self: *TerminalManager) void {
 
 /// Process a slice of VT input (raw bytes including ANSI sequences)
 pub fn processInput(self: *TerminalManager, data: []const u8) !void {
-    if (self.stream == null) self.stream = .initAlloc(self.allocator, .{
-        .inner = self.terminal.vtHandler(),
-        .manager = self,
-    });
-    try self.stream.?.nextSlice(data);
+    if (self.stream == null) {
+        var stream = self.terminal.vtStream();
+        // A program asking for text on the clipboard changes no terminal
+        // state, so the terminal's own handler ignores it unless an effect
+        // says otherwise. This is the only route a program has to the system
+        // clipboard.
+        stream.handler.effects.clipboard_write = &clipboardWritten;
+        self.stream = stream;
+    }
+    self.stream.?.nextSlice(data);
     log.debug("Processed {} bytes of input", .{data.len});
 }
 
-/// Record what an OSC 52 write asked for. Failing to decode it is the program's
-/// mistake and there is nobody to report it to, so it is dropped.
-fn clipboardWritten(self: *TerminalManager, kind: u8, data: []const u8) void {
+/// Record what a clipboard write asked for. The handler carries no user data,
+/// so the manager is recovered from the terminal it owns.
+fn clipboardWritten(
+    handler: *ghostty_vt.TerminalStream.Handler,
+    write: ghostty_vt.clipboard.Write,
+) void {
     // Only the system clipboard: the selection kinds have no counterpart here.
-    // A "?" payload is a read, which wants a reply this stream cannot send.
-    if (kind != 'c') return;
-    if (data.len == 0 or std.mem.eql(u8, data, "?")) return;
+    if (write.location != .standard) return;
 
-    const decoder = std.base64.standard.Decoder;
-    const size = decoder.calcSizeForSlice(data) catch return;
-    const text = self.allocator.alloc(u8, size) catch return;
-    decoder.decode(text, data) catch {
-        self.allocator.free(text);
-        return;
-    };
+    // The clipboard reaches the host as a string, so a write is only of
+    // interest for as long as it is text. An empty write asks for the
+    // clipboard to be cleared, and there is no route here for that.
+    const text = for (write.contents) |content| {
+        if (ghostty_vt.clipboard.isTextMime(content.mime)) break content.data;
+    } else return;
+    if (text.len == 0) return;
 
+    const self: *TerminalManager = @fieldParentPtr("terminal", handler.terminal);
+    const owned = self.allocator.dupe(u8, text) catch return;
     if (self.clipboard_write) |old| self.allocator.free(old);
-    self.clipboard_write = text;
-    log.debug("clipboard write of {} bytes", .{text.len});
+    self.clipboard_write = owned;
+    log.debug("clipboard write of {} bytes", .{owned.len});
 }
 
 /// The pending clipboard write, ownership passing to the caller.
