@@ -104,7 +104,7 @@ pub fn extractCells(
             const cell = pin.rowAndCell().cell;
 
             // Get the style for this cell
-            const page = pin.node.data;
+            const page = pin.node.page();
             const style_val = page.styles.get(page.memory, cell.style_id);
 
             // Extract foreground color
@@ -150,14 +150,14 @@ pub fn extractCells(
             const grapheme_codepoints: ?[]const u21 = null;
 
             const primary_codepoint: u21 = switch (cell.content_tag) {
-                .codepoint => cell.content.codepoint,
+                .codepoint => cell.content.codepoint.data,
                 .codepoint_grapheme => blk: {
                     // This cell contains a grapheme cluster
                     // TODO: Extract additional codepoints from grapheme storage
                     // For now, we'll just use the base codepoint
                     // In a full implementation, we'd access the grapheme storage
                     // from the page to get all codepoints in the cluster
-                    break :blk cell.content.codepoint;
+                    break :blk cell.content.codepoint.data;
                 },
                 .bg_color_palette, .bg_color_rgb => ' ', // Color-only cells render as space
             };

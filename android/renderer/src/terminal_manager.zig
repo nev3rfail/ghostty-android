@@ -103,9 +103,16 @@ pub fn init(
     };
 
     // A caller that says nothing keeps whatever the library considers sane.
-    if (max_scrollback) |bytes| opts.max_scrollback = bytes;
+    if (max_scrollback) |bytes| opts.max_scrollback_bytes = bytes;
 
-    const terminal = try ghostty_vt.Terminal.init(allocator, opts);
+    // The terminal wants an Io for the features that reach a filesystem, and
+    // TinyIo is the one upstream ships for embedders: zero-sized, stateless,
+    // and blocking, so it costs a parameter and nothing else.
+    const terminal = try ghostty_vt.Terminal.init(
+        ghostty_vt.TinyIo.init.io(),
+        allocator,
+        opts,
+    );
 
     // Verify modes were set correctly
     const wraparound_enabled = terminal.modes.get(.wraparound);
@@ -186,11 +193,10 @@ pub fn resize(self: *TerminalManager, cols: u16, rows: u16) !void {
     });
 
     // Perform the resize
-    try self.terminal.resize(
-        self.allocator,
-        @intCast(cols),
-        @intCast(rows),
-    );
+    try self.terminal.resize(self.allocator, .{
+        .cols = @intCast(cols),
+        .rows = @intCast(rows),
+    });
 
     // Check state after resize
     const cursor_after = self.terminal.screens.active.cursor;
@@ -511,7 +517,7 @@ pub fn getHyperlinkAtCell(self: *TerminalManager, col: u16, row: u16) !?[]const 
     }
 
     // Get the page for this row
-    const page_ptr = &row_pins[row].node.data;
+    const page_ptr = row_pins[row].node.page();
 
     // Get the row and cell at the position
     const rac = page_ptr.getRowAndCell(col, row);
