@@ -75,7 +75,7 @@ pub const WidthCache = struct {
         }
 
         // Cache miss - get width from libghostty
-        const width = getWidthFromLibghostty(codepoint);
+        const width = codepointWidth(codepoint);
 
         // Add to cache (simple replacement strategy)
         const entry_idx = @mod(codepoint, CacheSize); // Simple index
@@ -99,54 +99,10 @@ pub const WidthCache = struct {
     }
 };
 
-/// Get width directly from libghostty without caching
-fn getWidthFromLibghostty(codepoint: u21) u8 {
-    // Simple width calculation based on Unicode ranges
-    // This is a simplified version that covers common cases
-
-    // ASCII and control characters
-    if (codepoint < 0x80) {
-        // Control characters have width 0
-        if (codepoint < 0x20 or codepoint == 0x7F) return 0;
-        // Printable ASCII has width 1
-        return 1;
-    }
-
-    // Zero-width characters (combining marks, etc.)
-    if ((codepoint >= 0x0300 and codepoint <= 0x036F) or // Combining Diacritical Marks
-        (codepoint >= 0x1AB0 and codepoint <= 0x1AFF) or // Combining Diacritical Marks Extended
-        (codepoint >= 0x1DC0 and codepoint <= 0x1DFF) or // Combining Diacritical Marks Supplement
-        (codepoint >= 0x20D0 and codepoint <= 0x20FF) or // Combining Diacritical Marks for Symbols
-        (codepoint >= 0xFE20 and codepoint <= 0xFE2F))   // Combining Half Marks
-    {
-        return 0;
-    }
-
-    // Wide characters (CJK, fullwidth forms, emoji)
-    if ((codepoint >= 0x1100 and codepoint <= 0x115F) or // Hangul Jamo
-        (codepoint >= 0x2E80 and codepoint <= 0x2FFF) or // CJK Radicals
-        (codepoint >= 0x3000 and codepoint <= 0x303F) or // CJK Symbols
-        (codepoint >= 0x3040 and codepoint <= 0x309F) or // Hiragana
-        (codepoint >= 0x30A0 and codepoint <= 0x30FF) or // Katakana
-        (codepoint >= 0x3400 and codepoint <= 0x4DBF) or // CJK Extension A
-        (codepoint >= 0x4E00 and codepoint <= 0x9FFF) or // CJK Unified Ideographs
-        (codepoint >= 0xF900 and codepoint <= 0xFAFF) or // CJK Compatibility
-        (codepoint >= 0xFF00 and codepoint <= 0xFF60) or // Fullwidth Forms
-        (codepoint >= 0xFFE0 and codepoint <= 0xFFE6) or // Fullwidth symbols
-        (codepoint >= 0x20000 and codepoint <= 0x2FFFD) or // CJK Extension B-F
-        (codepoint >= 0x1F300 and codepoint <= 0x1F9FF))  // Emoji
-    {
-        return 2;
-    }
-
-    // Default to width 1 for everything else
-    return 1;
-}
-
 /// Get the display width of a codepoint (0, 1, or 2)
 /// This is a direct interface without caching for one-off lookups
 pub fn codepointWidth(codepoint: u21) u8 {
-    return getWidthFromLibghostty(codepoint);
+    return ghostty_vt.unicode.codepointWidth(codepoint);
 }
 
 test "WidthCache basic functionality" {
