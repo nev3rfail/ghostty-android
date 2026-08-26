@@ -198,6 +198,10 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
         // Sweep direction constants (animation timing is managed in native renderer)
         private const val FOLLOW_UP_FRAME_MS = 300L
 
+        // A fling reports travel relative to where it started, so it starts far
+        // enough from either end of its own range to never reach one.
+        private const val FLING_ORIGIN_PX = 1 shl 20
+
         private const val SWEEP_UP = 1
         private const val SWEEP_DOWN = 2
     }
@@ -220,8 +224,13 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     private var systemGestureInsetLeft = 0
     private var systemGestureInsetRight = 0
 
-    // Visual scroll pixel offset for smooth sub-row animation (0 to fontLineSpacing)
-    private var scrollPixelOffset = 0f
+    // Travel gathered from a gesture and not yet turned into rows. GL thread only.
+    private var glScrollPixels = 0f
+
+    // The sub-row shift the terminal is drawing with, published for the touch to
+    // cell conversion that runs on the main thread.
+    @Volatile
+    private var visualScrollResidual = 0f
 
     // Two-finger gesture state
     private var twoFingerGestureActive = false
@@ -237,8 +246,9 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     // Computed pixel thresholds (set in init)
     private var twoFingerTapMaxDistancePx = 0f
 
-    // Last row position used by OverScroller (for tracking delta during fling)
-    private var lastScrollerRow = 0
+    // Scroller position at the last fling frame, so a frame can tell how far the
+    // fling travelled since the one before it
+    private var lastScrollerY = 0
 
     // Terminal event listener
     private var eventListener: TerminalEventListener? = null
@@ -252,7 +262,10 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     private var bottomOffsetAnimationTargetValue = 0f
     private val bottomOffsetInterpolator = DecelerateInterpolator()
     private var lastBottomOffsetExpanded = false  // Track last state for callback
-    private var shouldScrollContentWithOverlay = true  // Whether to scroll content when overlay expands
+    // Written on the GL thread, which is where the content height it depends on
+    // can be read, and consulted on both.
+    @Volatile
+    private var shouldScrollContentWithOverlay = true
 
     // Selection mode state
     private var isSelectionMode = false
@@ -275,84 +288,104 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
     // Frame callback for scroll animation
     private val scrollAnimationCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
-            // Check if we should stop animation (e.g., scrollToBottom was called externally,
-            // or terminal was cleared and no longer has scrollback)
-            if (renderer.isViewportAtBottom() && renderer.getScrollbackRows() == 0) {
-                scroller.forceFinished(true)
-                isAnimating = false
-                scrollPixelOffset = 0f
-                lastScrollerRow = 0
-                // Only reset if no active bottom offset
-                if (bottomOffset == 0f) {
-                    queueEvent {
-                        renderer.setScrollPixelOffset(0f)
-                        requestRender()
-                    }
-                }
-                return
-            }
-
             if (!scroller.computeScrollOffset()) {
-                // Animation finished - reset pixel offset to clean state
                 isAnimating = false
-                scrollPixelOffset = 0f
-                // Only reset if no active bottom offset
-                if (bottomOffset == 0f) {
-                    queueEvent {
-                        renderer.setScrollPixelOffset(0f)
-                        requestRender()
-                    }
-                }
+                queueEvent { settleScroll() }
                 return
             }
 
-            val fontLineSpacing = renderer.getFontLineSpacing()
-            val scrollbackRows = renderer.getScrollbackRows()
-            val maxPixelY = scrollbackRows * fontLineSpacing
-
-            // Clamp to valid scroll bounds - don't let overfling affect terminal state
-            val currentPixelY = scroller.currY.toFloat().coerceIn(0f, maxPixelY)
-
-            if (fontLineSpacing > 0) {
-                // Calculate target row and sub-row offset from clamped pixel position
-                val targetRow = (currentPixelY / fontLineSpacing).toInt().coerceAtMost(scrollbackRows)
-                var newPixelOffset = currentPixelY - (targetRow * fontLineSpacing)
-                newPixelOffset = newPixelOffset.coerceIn(0f, fontLineSpacing - 1f)
-
-                // Update terminal viewport when crossing row boundaries
-                val rowDelta = targetRow - lastScrollerRow
-                if (rowDelta != 0) {
-                    lastScrollerRow = targetRow
-                    queueEvent {
-                        renderer.scrollDelta(rowDelta)
-                    }
-                }
-
-                // Update visual offset for smooth sub-row animation
-                scrollPixelOffset = newPixelOffset
-                queueEvent {
-                    renderer.setScrollPixelOffset(scrollPixelOffset)
-                    requestRender()
-                }
+            // Travel since the previous frame. The scroller's absolute position
+            // means nothing to the terminal; only the difference does.
+            val travel = (scroller.currY - lastScrollerY).toFloat()
+            lastScrollerY = scroller.currY
+            if (travel != 0f) {
+                queueEvent { applyScrollPixels(travel) }
             }
 
-            // Handle edge effects at fling boundaries
-            if (scroller.isOverScrolled) {
-                val currVelocity = scroller.currVelocity.toInt()
-                val scrollbackRows = renderer.getScrollbackRows()
-                val maxPixelY = scrollbackRows * fontLineSpacing
-
-                if (currentPixelY <= 0 && !edgeEffectTop.isFinished) {
-                    edgeEffectTop.onAbsorb(currVelocity)
-                } else if (currentPixelY >= maxPixelY && !edgeEffectBottom.isFinished) {
-                    edgeEffectBottom.onAbsorb(currVelocity)
-                }
-            }
-
-            // Continue animation on next vsync
             choreographer.postFrameCallback(this)
         }
     }
+
+    /**
+     * Applies finger travel to the viewport. GL thread only.
+     *
+     * Travel accumulates until it crosses a row, the row delta goes to the
+     * terminal, and what the viewport actually moved decides what survives: a
+     * step the viewport refused leaves no remainder to build on, so a gesture
+     * cannot accumulate against a limit it has already reached.
+     *
+     * The alternative is to ask the terminal whether it has reached the top, and
+     * the answer is a viewport offset that reads as zero for more reasons than
+     * having arrived there. A boundary resting on it stays true once it is true.
+     */
+    private fun applyScrollPixels(pixels: Float) {
+        glScrollPixels += pixels
+        val step = scrollStep(glScrollPixels, renderer.getFontLineSpacing())
+
+        val applied = if (step.rows == 0) {
+            step
+        } else {
+            val before = renderer.getViewportOffset()
+            renderer.scrollDelta(step.rows)
+            afterMovement(step, renderer.getViewportOffset() - before)
+        }
+
+        glScrollPixels = applied.residual
+        visualScrollResidual = applied.residual
+        renderer.setScrollPixelOffset(applied.residual)
+        requestRender()
+
+        if (applied.rows != step.rows) {
+            post { onScrollRefused(pixels) }
+        }
+    }
+
+    /**
+     * Lands the viewport on a whole row once nothing is driving it. GL thread only.
+     */
+    private fun settleScroll() {
+        glScrollPixels = 0f
+        visualScrollResidual = 0f
+        if (bottomOffset == 0f) {
+            renderer.setScrollPixelOffset(0f)
+            requestRender()
+        }
+    }
+
+    /**
+     * Drops travel gathered but not yet applied, keeping whatever shift the
+     * keyboard overlay is showing. GL thread only.
+     */
+    private fun discardPendingScroll() {
+        glScrollPixels = 0f
+        visualScrollResidual = 0f
+        renderer.setScrollPixelOffset(if (shouldScrollContentWithOverlay) bottomOffset else 0f)
+        requestRender()
+    }
+
+    /**
+     * The viewport travelled less than it was asked to, so the gesture has reached
+     * an end of the buffer. Main thread.
+     */
+    private fun onScrollRefused(pixels: Float) {
+        val effect = if (pixels < 0f) edgeEffectTop else edgeEffectBottom
+        effect.setSize(width, height)
+        if (isAnimating) {
+            effect.onAbsorb(scroller.currVelocity.toInt())
+            scroller.forceFinished(true)
+            choreographer.removeFrameCallback(scrollAnimationCallback)
+            isAnimating = false
+        } else {
+            effect.onPull(abs(pixels) / height.coerceAtLeast(1))
+        }
+    }
+
+    /**
+     * Whether the viewport follows the active area, for the keyboard overlay's
+     * benefit. The one terminal read left on a gesture path, and reachable only
+     * where a host sets a maximum bottom offset.
+     */
+    private fun isViewportAtBottomForOverlay(): Boolean = renderer.isViewportAtBottom()
 
     // Frame callback for bottom offset snap animation
     private val bottomOffsetAnimationCallback = object : Choreographer.FrameCallback {
@@ -528,17 +561,11 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
                     choreographer.removeFrameCallback(bottomOffsetAnimationCallback)
                     isBottomOffsetAnimating = false
                 }
-                // Reset visual pixel offset when touch begins
-                scrollPixelOffset = 0f
-                lastScrollerRow = renderer.getViewportOffset()
                 // Reset bottom offset drag tracking
                 bottomOffsetDragStart = bottomOffset
                 accumulatedBottomDrag = bottomOffset  // Start from current offset
-                // Preserve scroll offset only if content should scroll with overlay
-                queueEvent {
-                    val scrollOffset = if (shouldScrollContentWithOverlay) bottomOffset else 0f
-                    renderer.setScrollPixelOffset(scrollOffset)
-                }
+                // A gesture starts from whole rows.
+                queueEvent { discardPendingScroll() }
                 return true
             }
 
@@ -548,89 +575,39 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
                 distanceX: Float,
                 distanceY: Float
             ): Boolean {
-                // Get font line spacing for converting pixels to rows
-                val fontLineSpacing = renderer.getFontLineSpacing()
-                if (fontLineSpacing <= 0) return false
-
-                // Accumulate scroll distance in pixels
-                scrollPixelOffset += distanceY
-
-                // Check boundaries
-                val currentRow = renderer.getViewportOffset()
-                val isAtTop = currentRow == 0
-                val isAtBottom = renderer.isViewportAtBottom()
-
-                // Calculate how many full rows to scroll
-                var rowsDelta = 0
-
                 // Handle bottom offset mode (for keyboard area)
                 // Enter this mode when: at bottom and swiping up, OR already have offset
-                if (maxBottomOffset > 0 && (bottomOffset > 0 || (isAtBottom && distanceY > 0))) {
+                if (maxBottomOffset > 0 &&
+                    (bottomOffset > 0 || (distanceY > 0 && isViewportAtBottomForOverlay()))
+                ) {
                     accumulatedBottomDrag += distanceY
                     val newOffset = accumulatedBottomDrag.coerceIn(0f, maxBottomOffset)
                     if (newOffset != bottomOffset) {
                         bottomOffset = newOffset
 
-                        // Calculate whether content should scroll during drag
-                        val contentHeight = renderer.getContentHeight()
-                        val visibleHeightWithKeyboard = height - maxBottomOffset
-                        shouldScrollContentWithOverlay = contentHeight > visibleHeightWithKeyboard
-
-                        Log.d(TAG, "Overlay drag: contentHeight=$contentHeight, visibleHeight=$visibleHeightWithKeyboard, shouldScroll=$shouldScrollContentWithOverlay, viewHeight=$height, maxOffset=$maxBottomOffset")
-
                         queueEvent {
-                            val scrollOffset = if (shouldScrollContentWithOverlay) bottomOffset else 0f
-                            renderer.setScrollPixelOffset(scrollOffset)
+                            // Whether the content travels with the overlay depends on
+                            // how much content there is, which the terminal knows.
+                            shouldScrollContentWithOverlay =
+                                renderer.getContentHeight() > height - maxBottomOffset
+                            renderer.setScrollPixelOffset(
+                                if (shouldScrollContentWithOverlay) bottomOffset else 0f
+                            )
                             requestRender()
                         }
                         eventListener?.onKeyboardOverlayProgress(bottomOffset, maxBottomOffset)
                     }
-                    // Reset scrollPixelOffset so normal scrolling starts fresh when we exit
-                    scrollPixelOffset = 0f
+                    // Travel here belongs to the overlay, so scrolling starts from
+                    // nothing when the drag leaves this branch.
+                    queueEvent { discardPendingScroll() }
                     return true
                 }
 
-                // distanceY > 0 = finger moved UP = scroll DOWN (towards active area)
-                // scrollPixelOffset accumulates positive values, crossing row boundaries
-                if (isAtBottom && scrollPixelOffset > 0) {
-                    // At bottom, can't scroll down - show edge effect
-                    edgeEffectBottom.onPull(abs(distanceY) / height)
-                    edgeEffectBottom.setSize(width, height)
-                    scrollPixelOffset = 0f
-                } else {
-                    // Normal scroll - handle row crossings
-                    while (scrollPixelOffset >= fontLineSpacing) {
-                        scrollPixelOffset -= fontLineSpacing
-                        rowsDelta += 1  // Scroll down (towards active area)
-                    }
-                }
-
-                // distanceY < 0 = finger moved DOWN = scroll UP (towards scrollback)
-                // scrollPixelOffset goes negative, crossing row boundaries upward
-                if (isAtTop && scrollPixelOffset < 0) {
-                    // At top, can't scroll up - clamp offset and trigger edge effect
-                    edgeEffectTop.onPull(abs(distanceY) / height)
-                    edgeEffectTop.setSize(width, height)
-                    scrollPixelOffset = 0f
-                } else {
-                    while (scrollPixelOffset < 0) {
-                        scrollPixelOffset += fontLineSpacing
-                        rowsDelta -= 1  // Scroll up (towards scrollback)
-                    }
-                }
-
-                // Final clamp to ensure valid range
-                scrollPixelOffset = scrollPixelOffset.coerceIn(0f, fontLineSpacing - 1f)
-
-                // Apply updates to renderer
-                queueEvent {
-                    if (rowsDelta != 0) {
-                        renderer.scrollDelta(rowsDelta)
-                    }
-                    renderer.setScrollPixelOffset(scrollPixelOffset)
-                    requestRender()
-                }
-
+                // Positive travel is towards the active area at the bottom. The row
+                // arithmetic, the boundary and the sub-row shift belong to the GL
+                // thread, which is the only one that may read the terminal without
+                // waiting behind a burst of output.
+                queueEvent { applyScrollPixels(distanceY) }
                 return true
             }
 
@@ -641,46 +618,30 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
                 velocityY: Float
             ): Boolean {
                 // Don't fling if we're in bottom offset mode - let the snap animation handle it
-                if (bottomOffset > 0 || (maxBottomOffset > 0 && renderer.isViewportAtBottom() && velocityY < 0)) {
+                if (bottomOffset > 0 ||
+                    (maxBottomOffset > 0 && velocityY < 0 && isViewportAtBottomForOverlay())
+                ) {
                     return false
                 }
 
-                val scrollbackRows = renderer.getScrollbackRows()
-                if (scrollbackRows == 0) return false
-
-                val fontLineSpacing = renderer.getFontLineSpacing()
-                if (fontLineSpacing <= 0) return false
-
-                // Calculate current position in pixels for OverScroller
-                // currentOffset is in rows, scrollPixelOffset is sub-row offset
-                val currentOffset = renderer.getViewportOffset()
-                val maxPixelY = scrollbackRows * fontLineSpacing
-
-                // Clamp scrollPixelOffset and ensure we don't exceed bounds
-                scrollPixelOffset = scrollPixelOffset.coerceIn(0f, fontLineSpacing - 1f)
-                var currentPixelY = currentOffset * fontLineSpacing + scrollPixelOffset
-
-                // Clamp starting position to valid scroll bounds
-                currentPixelY = currentPixelY.coerceIn(0f, maxPixelY)
-
-                // Initialize lastScrollerRow from pixel position to avoid jump at start
-                lastScrollerRow = (currentPixelY / fontLineSpacing).toInt()
-
-                // Start fling animation using pixel coordinates (native Android feel)
-                // Android convention: fling UP (velocityY < 0) = content moves UP = see content below
-                // Our convention: Y increases towards active area (bottom)
-                // So fling UP should INCREASE Y, but negative velocity DECREASES Y
-                // Therefore: negate velocity
+                // The scroller runs in pixels from a local origin: where the
+                // viewport sits and how far it may travel belong to the thread
+                // that owns the terminal, and the fling ends when that thread
+                // reports travel it could not apply.
+                //
+                // Android's convention is that a fling upwards carries negative
+                // velocity and reveals content below, which is travel towards the
+                // active area here, so the velocity is negated.
+                lastScrollerY = FLING_ORIGIN_PX
                 scroller.forceFinished(true)
                 scroller.fling(
-                    0, currentPixelY.toInt(),           // startX, startY (pixels)
-                    0, -velocityY.toInt(),              // velocityX, velocityY (negated for correct direction)
-                    0, 0,                               // minX, maxX
-                    0, maxPixelY.toInt(),               // minY, maxY (pixels)
-                    0, height / 4                       // overX, overY (allow some overfling)
+                    0, FLING_ORIGIN_PX,
+                    0, -velocityY.toInt(),
+                    0, 0,
+                    0, FLING_ORIGIN_PX * 2,
+                    0, height / 4
                 )
 
-                // Start animation using Choreographer (runs at vsync for smooth 60fps)
                 if (!isAnimating) {
                     isAnimating = true
                     choreographer.postFrameCallback(scrollAnimationCallback)
@@ -899,7 +860,7 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
         if (cellWidth <= 0 || cellHeight <= 0) return null
 
         val col = (pixelX / cellWidth).toInt()
-        val row = ((pixelY + scrollPixelOffset) / cellHeight).toInt()
+        val row = ((pixelY + visualScrollResidual) / cellHeight).toInt()
 
         val gridSize = renderer.getGridSize()
         if (col < 0 || col >= gridSize[0] || row < 0) return null
