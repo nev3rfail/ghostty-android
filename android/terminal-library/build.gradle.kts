@@ -63,6 +63,8 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
+
+    testImplementation("junit:junit:4.13.2")
 }
 
 // Task to build native libraries for all ABIs
