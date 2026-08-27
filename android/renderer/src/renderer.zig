@@ -44,7 +44,7 @@ allocator: std.mem.Allocator,
 font_system: DynamicFontSystem,
 
 /// Terminal manager for VT processing
-terminal_manager: TerminalManager,
+terminal_manager: *TerminalManager,
 
 /// Mutex for thread-safe access to terminal_manager
 /// Allows processInput to be called from any thread while render runs on GL thread
@@ -167,6 +167,10 @@ preedit_active: bool = false,
 
 /// Initialize the renderer with optional initial dimensions and font size
 /// If initial_font_size_px is 0, uses the default font size.
+/// terminal_manager outlives the OpenGL context, which is recreated whenever
+/// the app returns to the foreground. The renderer borrows it and never frees
+/// it: the terminal's modes and history belong to the session, not to a GL
+/// context.
 /// max_scrollback is the terminal history budget in bytes; null keeps the
 /// library default.
 pub fn init(
@@ -176,7 +180,9 @@ pub fn init(
     dpi: u16,
     initial_font_size_px: u32,
     max_scrollback: ?usize,
+    terminal_manager: *TerminalManager,
 ) !Self {
+    _ = max_scrollback;
     log.info("Initializing renderer with dimensions: {d}x{d}, font size: {d}px", .{ width, height, initial_font_size_px });
 
     // Load and compile bg_color shaders
@@ -298,16 +304,11 @@ pub fn init(
     // Bind SSBO to binding point 1 (matches shader layout)
     cells_bg_buffer.bindBase(1);
 
-    // Initialize terminal manager with calculated dimensions
-    var terminal_manager = try TerminalManager.init(
-        allocator,
-        @intCast(initial_grid_cols),
-        @intCast(initial_grid_rows),
-        max_scrollback,
-    );
-    errdefer terminal_manager.deinit();
+    // The manager is the caller's, and may already be carrying a session from
+    // before the context was recreated. Only its size is the renderer's business.
+    try terminal_manager.resize(@intCast(initial_grid_cols), @intCast(initial_grid_rows));
 
-    log.info("Terminal manager initialized ({d}x{d})", .{ initial_grid_cols, initial_grid_rows });
+    log.info("Terminal manager sized ({d}x{d})", .{ initial_grid_cols, initial_grid_rows });
 
     // Get atlas dimensions from dynamic font system
     const font_atlas_dims = font_system.getAtlasDimensions();
@@ -587,7 +588,6 @@ pub fn deinit(self: *Self) void {
     self.cells_bg_buffer.deinit();
     self.bg_color_pipeline.deinit();
     self.uniforms_buffer.deinit();
-    self.terminal_manager.deinit();
     self.font_system.deinit();
 }
 

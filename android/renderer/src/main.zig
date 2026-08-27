@@ -11,6 +11,7 @@ const c = @import("c.zig").c;
 
 const jni = @import("jni_bridge.zig");
 const Renderer = @import("renderer.zig");
+const TerminalManager = @import("terminal_manager.zig");
 
 /// The blocking Io a mutex parks on. TinyIo is stateless and zero-sized, and
 /// its futex operations are all a mutex asks for.
@@ -83,6 +84,12 @@ var gpa: std.heap.DebugAllocator(.{}) = .init;
 // Renderer state - now stored per-instance
 const RendererState = struct {
     renderer: ?Renderer = null,
+
+    /// The terminal, which outlives the OpenGL context. A context is recreated
+    /// every time the app returns to the foreground, and a terminal rebuilt with
+    /// it would lose the program's modes and the history -- so the program's
+    /// mouse reporting would stop being honoured until the program restarted.
+    terminal_manager: ?TerminalManager = null,
     initialized: bool = false,
     surface_sized: bool = false, // Track if surface has been sized at least once
     initial_font_size: u32 = 0, // Initial font size in pixels (0 = use default)
@@ -143,6 +150,9 @@ fn destroyRendererState(handle: u64) void {
         const state = kv.value;
         if (state.renderer) |*renderer| {
             renderer.deinit();
+        }
+        if (state.terminal_manager) |*manager| {
+            manager.deinit();
         }
         gpa.allocator().destroy(state);
         log.info("Destroyed renderer state with handle {d}", .{handle});
@@ -342,6 +352,17 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeOnSurfaceChang
         log.info("Initializing renderer for handle {d} with dimensions: {d}x{d} at {d} DPI, font size: {d}px", .{ handle, width, height, dpi, font_size });
 
         const allocator = gpa.allocator();
+        if (state.terminal_manager == null) {
+            state.terminal_manager = TerminalManager.init(
+                allocator,
+                80,
+                24,
+                if (state.max_scrollback > 0) state.max_scrollback else null,
+            ) catch |err| {
+                log.err("Failed to initialize terminal manager: {}", .{err});
+                return;
+            };
+        }
         state.renderer = Renderer.init(
             allocator,
             @intCast(width),
@@ -349,6 +370,7 @@ export fn Java_com_ghostty_android_renderer_GhosttyRenderer_nativeOnSurfaceChang
             @intCast(dpi),
             state.initial_font_size,
             if (state.max_scrollback > 0) state.max_scrollback else null,
+            &state.terminal_manager.?,
         ) catch |err| {
             log.err("Failed to initialize renderer: {}", .{err});
             return;
