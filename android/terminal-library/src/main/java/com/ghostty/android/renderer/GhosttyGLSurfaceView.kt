@@ -336,20 +336,34 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
      */
     private fun applyScrollPixels(pixels: Float) {
         // A program drawing its own screen keeps its own history and expects the
-        // wheel. Ask for the bytes before touching the viewport: under such a
-        // program the viewport holds nothing, so moving it is what makes the
-        // gesture read as broken.
-        val wheeled = scrollStep(glScrollPixels + pixels, renderer.getFontLineSpacing())
+        // wheel. Whether it is asking is settled before the viewport is touched
+        // at all: under such a program the viewport holds nothing, so entering
+        // that path is what makes the gesture read as broken.
+        val wheeled = wheelStep(glScrollPixels + pixels, renderer.getFontLineSpacing())
         val notches = wheelNotches(wheeled)
-        if (notches != 0) {
-            val report = renderer.encodeWheel(notches, lastTouchX.toInt(), lastTouchY.toInt())
-            if (report != null) {
-                val applied = afterWheel(wheeled)
-                glScrollPixels = applied.residual
-                visualScrollResidual = applied.residual
-                post { eventListener?.onInput(report) }
-                return
-            }
+
+        // The encoder answers null both when the program is not asking for the
+        // mouse and when it is asked for no notches, so a frame with nothing to
+        // send asks for one notch and drops the answer. That keeps the mode
+        // question to the one call the frame already makes.
+        val report = renderer.encodeWheel(
+            if (notches != 0) notches else 1,
+            lastTouchX.toInt(),
+            lastTouchY.toInt(),
+        )
+        if (report != null) {
+            // The gesture belongs to the program, so travel worth less than a
+            // notch is carried rather than dropped. The viewport path is not
+            // entered at all: on an alternate screen it finds no room, and its
+            // refusal would zero this accumulation and pull the edge effect --
+            // which is a glow and a lost notch on every frame between notches.
+            val applied = afterWheel(wheeled)
+            glScrollPixels = applied.residual
+            // Nothing is drawn as a sub-row shift here, so nothing is published
+            // as one either: the touch to cell conversion reads this.
+            visualScrollResidual = 0f
+            if (notches != 0) post { eventListener?.onInput(report) }
+            return
         }
 
         val available = rowsAvailable(pixels, renderer.getScrollCapacity())

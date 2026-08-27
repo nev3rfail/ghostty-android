@@ -1,5 +1,6 @@
 package com.ghostty.android.renderer
 
+import kotlin.math.abs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -170,6 +171,51 @@ class ScrollArithmeticTest {
         assertEquals(0, wheelNotches(step))
         // and the remainder survives, so the next frame can reach a notch
         assertEquals(CELL / 3f, afterWheel(step).residual, EPSILON)
+    }
+
+    @Test
+    fun `a wheel notch waits for a whole row in either direction`() {
+        val towards = wheelStep(accumulatedPixels = CELL - 1f, cellHeight = CELL)
+        assertEquals(0, towards.rows)
+        assertEquals(CELL - 1f, towards.residual, EPSILON)
+
+        val away = wheelStep(accumulatedPixels = -(CELL - 1f), cellHeight = CELL)
+        assertEquals(0, away.rows)
+        assertEquals(-(CELL - 1f), away.residual, EPSILON)
+
+        assertEquals(1, wheelStep(CELL, CELL).rows)
+        assertEquals(-1, wheelStep(-CELL, CELL).rows)
+    }
+
+    @Test
+    fun `wheel travel splits towards zero and keeps the sign of its remainder`() {
+        val step = wheelStep(accumulatedPixels = -(2 * CELL + 5f), cellHeight = CELL)
+        assertEquals(-2, step.rows)
+        assertEquals(-5f, step.residual, EPSILON)
+
+        val other = wheelStep(accumulatedPixels = 2 * CELL + 5f, cellHeight = CELL)
+        assertEquals(2, other.rows)
+        assertEquals(5f, other.residual, EPSILON)
+    }
+
+    @Test
+    fun `a steady drag sends one notch per row and no more`() {
+        // What a gesture actually does: small travel arriving frame by frame,
+        // with the remainder carried. Ten rows of travel is ten notches.
+        var accumulated = 0f
+        var notches = 0
+        repeat(200) {
+            accumulated += -CELL / 20f
+            val step = wheelStep(accumulated, CELL)
+            notches += abs(wheelNotches(step))
+            accumulated = step.residual
+        }
+        assertEquals(10, notches)
+    }
+
+    @Test
+    fun `a cell height that is not yet known consumes nothing`() {
+        assertEquals(ScrollStep.None, wheelStep(accumulatedPixels = 100f, cellHeight = 0f))
     }
 
     private companion object {

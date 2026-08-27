@@ -66,6 +66,22 @@ fun rowsAvailable(pixels: Float, capacity: IntArray): Int {
 fun wheelNotches(step: ScrollStep): Int = step.rows
 
 /**
+ * Splits accumulated travel into whole notches and the remainder to carry.
+ *
+ * The split is towards zero and the remainder keeps its sign, so the first notch
+ * waits for a whole row of travel whichever way the finger goes. [scrollStep]
+ * rounds down instead, because the viewport draws its remainder as a shift in
+ * one direction only; a notch is drawn as nothing, so rounding down there would
+ * fire on the first pixel travelled towards the history and wait a full row in
+ * the other direction.
+ */
+fun wheelStep(accumulatedPixels: Float, cellHeight: Float): ScrollStep {
+    if (cellHeight <= 0f) return ScrollStep.None
+    val rows = (accumulatedPixels / cellHeight).toInt()
+    return ScrollStep(rows, accumulatedPixels - rows * cellHeight)
+}
+
+/**
  * What a frame's travel does when the program is holding the wheel.
  *
  * Bytes went to the program, so the viewport does not move and the remainder
