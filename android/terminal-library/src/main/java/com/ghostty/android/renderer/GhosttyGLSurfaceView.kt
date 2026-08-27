@@ -561,10 +561,6 @@ class GhosttyGLSurfaceView @JvmOverloads constructor(
             0   // stencil
         )
 
-        // Make the GL surface visible on top of the window background
-        // This is needed because GLSurfaceView renders in a separate window by default
-        setZOrderOnTop(true)
-
         // Create and set the renderer (pass context for DPI access and initial font size)
         // Always pass a valid font size (use currentFontSize which defaults to DEFAULT_FONT_SIZE)
         renderer = GhosttyRenderer(context, currentFontSize.toInt(), maxScrollbackBytes)
