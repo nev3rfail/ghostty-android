@@ -38,18 +38,25 @@ android {
         jvmTarget = "17"
     }
 
+    // -PprebuiltNative hands every native library to the application from one
+    // directory, so this module then builds and contributes none.
+    val prebuiltNative = project.hasProperty("prebuiltNative")
+
     sourceSets {
         getByName("main") {
-            jniLibs.srcDirs("src/main/jniLibs")
+            if (prebuiltNative) jniLibs.setSrcDirs(emptyList<Any>())
+            else jniLibs.srcDirs("src/main/jniLibs")
         }
     }
 
     // The pty support library. The renderer's own libraries are prebuilt with
     // Zig and picked up from jniLibs instead.
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+    if (!prebuiltNative) {
+        externalNativeBuild {
+            cmake {
+                path = file("src/main/cpp/CMakeLists.txt")
+                version = "3.22.1"
+            }
         }
     }
 
@@ -116,9 +123,10 @@ tasks.register<Exec>("buildNativeLibs") {
 // The Zig toolchain may live outside the Gradle host (a WSL distro, a remote box), in
 // which case the native libraries are built out-of-band by
 // scripts/build-android-nonix.sh. -PskipNativeBuild=true makes Gradle consume whatever
-// is already present in jniLibs.
+// is already present in jniLibs. -PprebuiltNative takes the libraries from elsewhere,
+// so it skips the build too.
 tasks.named("preBuild") {
-    if (!project.hasProperty("skipNativeBuild")) {
+    if (!project.hasProperty("skipNativeBuild") && !project.hasProperty("prebuiltNative")) {
         dependsOn("buildNativeLibs")
     }
 }
