@@ -55,6 +55,10 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
     });
 
+    // Align LOAD segments to 16 KB so the library loads on 16 KB page devices
+    // (Android 15+, and a Play requirement for target SDK 35+).
+    lib.link_z_max_page_size = 16384;
+
     // Link FreeType library
     lib_mod.linkLibrary(freetype_dep.artifact("freetype"));
 
