@@ -52,6 +52,14 @@ class Pty private constructor(
         descriptor.close()
     }
 
+    /**
+     * Release the file descriptor and signal nothing, for a process already
+     * reaped: its pid may belong to another process by now.
+     */
+    fun release() {
+        descriptor.close()
+    }
+
     companion object {
         const val SIGHUP = 1
         const val SIGINT = 2

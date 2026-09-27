@@ -35,7 +35,7 @@ class TerminalSession(
 
     /**
      * The pid of the process on the terminal, which leads the terminal's
-     * session, or null before it starts and after it is hung up.
+     * session, or null before it starts and once it has exited or been hung up.
      */
     val pid: Int? get() = pty?.pid
 
@@ -84,6 +84,14 @@ class TerminalSession(
             }
 
             val status = started.waitFor()
+            // A reaped pid can be given to another process, so the session stops
+            // naming it, and the terminal it ran on is closed with it.
+            synchronized(this@TerminalSession) {
+                if (pty === started) {
+                    runCatching { started.release() }
+                    pty = null
+                }
+            }
             _isRunning.value = false
             Log.d(TAG, "Process ${started.pid} exited with status $status")
             onExit(status)
@@ -116,8 +124,10 @@ class TerminalSession(
 
     /** Hang up the terminal, ending the process. */
     fun stop() {
-        pty?.close()
-        pty = null
+        synchronized(this) {
+            pty?.close()
+            pty = null
+        }
         _isRunning.value = false
     }
 
