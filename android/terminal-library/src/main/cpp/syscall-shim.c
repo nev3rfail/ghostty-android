@@ -326,8 +326,10 @@ static int translate_legacy(pid_t pid, struct user_regs_struct *r) {
         return 1;
 
     case NR_epoll_create:  // epoll_create(size)
+        // A size of 0 or less is EINVAL, which epoll_create1 gives for a flag
+        // it does not know.
         r->orig_rax = SYS_epoll_create1;
-        r->rdi = 0;
+        r->rdi = (int)a0 <= 0 ? 1 : 0;
         return 1;
 
     case NR_epoll_wait:  // epoll_wait(epfd, events, maxevents, timeout)

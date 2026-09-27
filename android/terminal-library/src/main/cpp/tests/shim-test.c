@@ -2,19 +2,21 @@
  * The tracee side of run.sh: each mode checks one thing the shim does and exits
  * 0 when it holds.
  *
- *   trap MODE ARGS...   traps getpgrp, fork, uselib, acct and the set-id calls
- *                       the way Android's policy does, then runs MODE ARGS...
- *                       in this program
+ *   trap MODE ARGS...   traps getpgrp, fork, uselib, acct, epoll_create and the
+ *                       set-id calls the way Android's policy does, then runs
+ *                       MODE ARGS... in this program
  *   parity N            a raw getpgrp and a raised SIGTRAP, then N execs of
  *                       itself that do the same
  *   thread-exec N       N execs, each from a thread other than the leader, each
  *                       thread making a raw getpgrp first
  *   threads N           N threads alive at once, each making a raw getpgrp
- *   enosys            a raw uselib returns ENOSYS and a raw acct EPERM, as
+ *   enosys              a raw uselib returns ENOSYS and a raw acct EPERM, as
  *                       trapped-calls.txt marks them, then a raw getpgrp works
  *   setid               set-id calls that change no id succeed, ones that change
  *                       one get EPERM, setgroups succeeds, and setfsuid and
  *                       setfsgid return the effective ids
+ *   epoll               epoll_create gives EINVAL for a size of 0 or less, and
+ *                       a descriptor otherwise
  *   own-trap            traps getppid with a filter and handler of its own; the
  *                       handler runs, then a raw getpgrp works
  *   fork N              N raw forks, checking the argument registers in parent
@@ -55,6 +57,7 @@ static int install(struct sock_filter *f, unsigned short n) {
 static const int legacy[] = {
 	SYS_getpgrp, SYS_fork, SYS_uselib, SYS_acct, SYS_setuid, SYS_setgid,
 	SYS_setreuid, SYS_setregid, SYS_setfsuid, SYS_setfsgid, SYS_setresgid, SYS_setgroups,
+	SYS_epoll_create,
 };
 #define NLEGACY (sizeof legacy / sizeof *legacy)
 
@@ -178,6 +181,14 @@ static int setid(void) {
 	         gives(syscall(SYS_setfsuid, u + 7), eu) && gives(syscall(SYS_setfsgid, g + 7), eg));
 }
 
+static int epoll(void) {
+	errno = 0;
+	if (syscall(SYS_epoll_create, 0) != -1 || errno != EINVAL) return 1;
+	errno = 0;
+	if (syscall(SYS_epoll_create, -1) != -1 || errno != EINVAL) return 1;
+	return syscall(SYS_epoll_create, 1) < 0;
+}
+
 /* fork with every argument register set; returns its result and the registers
  * as the call left them. */
 static long raw_fork(const long in[6], long out[6]) {
@@ -264,6 +275,7 @@ int main(int argc, char **argv) {
 	if (argc > 2 && !strcmp(argv[1], "fork-interrupted")) return forks_interrupted(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "enosys")) return enosys();
 	if (argc > 1 && !strcmp(argv[1], "own-trap")) return own_trap();
+	if (argc > 1 && !strcmp(argv[1], "epoll")) return epoll();
 	if (argc > 2 && !strcmp(argv[1], "threads")) return threads(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "setid")) return setid();
 	return tracer_pid();
