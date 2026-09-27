@@ -9,7 +9,8 @@
  *                       itself that do the same
  *   thread-exec N       N execs, each from a thread other than the leader, each
  *                       thread making a raw getpgrp first
- *   enosys              a raw uselib returns ENOSYS and a raw acct EPERM, as
+ *   threads N           N threads alive at once, each making a raw getpgrp
+ *   enosys            a raw uselib returns ENOSYS and a raw acct EPERM, as
  *                       trapped-calls.txt marks them, then a raw getpgrp works
  *   setid               set-id calls that change no id succeed, ones that change
  *                       one get EPERM, setgroups succeeds, and setfsuid and
@@ -131,6 +132,26 @@ static int thread_exec(int n) {
 	return 1;
 }
 
+static pthread_barrier_t all_started;
+
+static void *getpgrp_together(void *arg) {
+	(void)arg;
+	pthread_barrier_wait(&all_started);
+	return raw_getpgrp() ? 0 : (void *)1;
+}
+
+static int threads(int n) {
+	pthread_t t[n];
+	void *failed;
+	int bad = 0;
+	pthread_barrier_init(&all_started, 0, (unsigned)n);
+	for (int i = 0; i < n; i++)
+		if (pthread_create(&t[i], 0, getpgrp_together, 0)) return 1;
+	for (int i = 0; i < n; i++)
+		if (pthread_join(t[i], &failed) || failed) bad = 1;
+	return bad;
+}
+
 static int enosys(void) {
 	errno = 0;
 	if (syscall(SYS_uselib, 0) != -1 || errno != ENOSYS) return 1;
@@ -243,6 +264,7 @@ int main(int argc, char **argv) {
 	if (argc > 2 && !strcmp(argv[1], "fork-interrupted")) return forks_interrupted(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "enosys")) return enosys();
 	if (argc > 1 && !strcmp(argv[1], "own-trap")) return own_trap();
+	if (argc > 2 && !strcmp(argv[1], "threads")) return threads(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "setid")) return setid();
 	return tracer_pid();
 }

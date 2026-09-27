@@ -384,8 +384,6 @@ static int translate(pid_t pid, struct user_regs_struct *r) {
     return changed;
 }
 
-#define MAX_TRACEES 512
-
 struct tracee {
     pid_t pid;  // 0 for a free slot
     // The next syscall stop is an entry.
@@ -396,8 +394,6 @@ struct tracee {
     // signal of that stop, delivered when it starts.
     int held;
     int held_signal;
-    // Exited before its parent's fork event, which frees the slot.
-    int dead;
     // dup2(fd, fd) is answered by fcntl; the descriptor to report is kept here
     // until the exit stop can substitute it for fcntl's flags.
     long dup2_result;
@@ -409,20 +405,30 @@ struct tracee {
     unsigned long long fork_args[6];
 };
 
-static struct tracee tracees[MAX_TRACEES];
+// Every process and thread traced, in a table that doubles when it fills.
+// Adding a slot moves the table, so a slot pointer is used only until the
+// next add.
+static struct tracee *tracees;
+static size_t ntracees;
 
 static struct tracee *find(pid_t pid) {
-    for (int i = 0; i < MAX_TRACEES; i++)
+    for (size_t i = 0; i < ntracees; i++)
         if (tracees[i].pid == pid) return &tracees[i];
     return NULL;
 }
 
 static struct tracee *add(pid_t pid) {
     struct tracee *t = find(0);
-    if (t) {
-        memset(t, 0, sizeof *t);
-        t->pid = pid; t->in_entry = 1; t->dup2_result = -1;
+    if (!t) {
+        size_t n = ntracees ? 2 * ntracees : 64;
+        struct tracee *grown = realloc(tracees, n * sizeof *grown);
+        if (!grown) return NULL;
+        memset(grown + ntracees, 0, (n - ntracees) * sizeof *grown);
+        t = grown + ntracees;
+        tracees = grown; ntracees = n;
     }
+    memset(t, 0, sizeof *t);
+    t->pid = pid; t->in_entry = 1; t->dup2_result = -1;
     return t;
 }
 
@@ -432,24 +438,28 @@ static void drop(pid_t pid) {
 }
 
 // A slot for a new tracee. Without one its registers and parity cannot be
-// kept, so a tracee beyond MAX_TRACEES is killed.
+// kept, so a tracee the table cannot grow for is killed.
 static struct tracee *add_new(pid_t pid) {
     struct tracee *t = add(pid);
     if (!t) {
-        fprintf(stderr, "syscall-shim: more than %d processes and threads, killing %d\n",
-                MAX_TRACEES, pid);
+        fprintf(stderr, "syscall-shim: no memory to trace %d, killing it\n", pid);
         kill(pid, SIGKILL);
     }
     return t;
 }
 
-// pid exited. A tracee that has not had its parent's fork event keeps its slot
-// as dead until that event, so the event cannot give the slot to a later
-// process with the same pid.
-static void exited(pid_t pid) {
-    struct tracee *t = find(pid);
-    if (t && (t->started || !t->held)) { t->pid = 0; return; }
-    if (t || (t = add(pid))) { t->held = 0; t->dead = 1; }
+// Whether pid is traced by this process: false once it has exited and been
+// reaped, even when its pid is reused by a process this one does not trace.
+static int traced_here(pid_t pid) {
+    char path[64], line[256];
+    snprintf(path, sizeof path, "/proc/%d/status", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int tracer = 0;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "TracerPid:", 10)) { tracer = atoi(line + 10); break; }
+    fclose(f);
+    return tracer == getpid();
 }
 
 static int get_regs(pid_t pid, struct user_regs_struct *r) {
@@ -627,12 +637,16 @@ static void syscall_stop(struct tracee *t) {
 
 // A fork, vfork or clone event in parent, which may be NULL, naming child.
 static void new_child(struct tracee *parent, pid_t child, unsigned event) {
+    int copy = parent && parent->fork_saved && event == PTRACE_EVENT_FORK;
+    unsigned long long args[6];
+    if (copy) memcpy(args, parent->fork_args, sizeof args);
+
     struct tracee *c = find(child);
-    if (c && c->dead) { c->pid = 0; return; }
-    if (!c && !(c = add_new(child))) return;
+    // A child that has already exited and been reaped needs no slot.
+    if (!c && (!traced_here(child) || !(c = add_new(child)))) return;
     if (c->started) return;
-    if (parent && parent->fork_saved && event == PTRACE_EVENT_FORK) {
-        memcpy(c->fork_args, parent->fork_args, sizeof c->fork_args);
+    if (copy) {
+        memcpy(c->fork_args, args, sizeof c->fork_args);
         c->fork_saved = 1;
     }
     if (c->held) start(c, c->held_signal);
@@ -691,12 +705,12 @@ int main(int argc, char **argv) {
 
         if (WIFEXITED(status)) {
             if (pid == child) { exit_code = WEXITSTATUS(status); break; }
-            exited(pid);
+            drop(pid);
             continue;
         }
         if (WIFSIGNALED(status)) {
             if (pid == child) { exit_code = 128 + WTERMSIG(status); break; }
-            exited(pid);
+            drop(pid);
             continue;
         }
         if (!WIFSTOPPED(status)) continue;
@@ -706,8 +720,6 @@ int main(int argc, char **argv) {
         unsigned event = (unsigned)status >> 16;
         int deliver = 0;
 
-        // A dead slot names an earlier process with this pid.
-        if (t && t->dead) { t->pid = 0; t = NULL; }
         if (!t) {
             // A new tracee's first stop, which can arrive before its parent's
             // fork event. It waits for that event, which says whether it has
