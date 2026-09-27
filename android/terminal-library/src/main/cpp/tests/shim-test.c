@@ -2,13 +2,14 @@
  * The tracee side of run.sh: each mode checks one thing the shim does and exits
  * 0 when it holds.
  *
- *   trap MODE ARGS...   traps getpgrp, fork and uselib the way Android's policy
- *                       does, then runs MODE ARGS... in this program
+ *   trap MODE ARGS...   traps getpgrp, fork, uselib and acct the way Android's
+ *                       policy does, then runs MODE ARGS... in this program
  *   parity N            a raw getpgrp and a raised SIGTRAP, then N execs of
  *                       itself that do the same
  *   thread-exec N       N execs, each from a thread other than the leader, each
  *                       thread making a raw getpgrp first
- *   enosys              a raw uselib returns ENOSYS, then a raw getpgrp works
+ *   enosys              a raw uselib returns ENOSYS and a raw acct EPERM, as
+ *                       trapped-calls.txt marks them, then a raw getpgrp works
  *   own-trap            traps getppid with a filter and handler of its own; the
  *                       handler runs, then a raw getpgrp works
  *   fork N              N raw forks, checking the argument registers in parent
@@ -49,9 +50,10 @@ static int install(struct sock_filter *f, unsigned short n) {
 static int trap_legacy(void) {
 	struct sock_filter f[] = {
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpgrp, 3, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fork, 2, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_uselib, 1, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpgrp, 4, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fork, 3, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_uselib, 2, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_acct, 1, 0),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 	};
@@ -123,6 +125,8 @@ static int thread_exec(int n) {
 static int enosys(void) {
 	errno = 0;
 	if (syscall(SYS_uselib, 0) != -1 || errno != ENOSYS) return 1;
+	errno = 0;
+	if (syscall(SYS_acct, 0) != -1 || errno != EPERM) return 1;
 	return !raw_getpgrp();
 }
 

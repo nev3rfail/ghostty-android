@@ -11,8 +11,8 @@
 // specifically so a tracer's changes are the ones the filter judges. So a
 // tracer that rewrites the legacy call into its `*at` equivalent -- inserting
 // AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits. A
-// call the policy traps with no translation returns ENOSYS instead of raising
-// SIGSYS; trapped-calls.h lists them.
+// call the policy traps with no translation returns an error instead of raising
+// SIGSYS: EPERM or ENOSYS, as trapped-calls.h lists it.
 //
 // The shim traces the whole tree it starts, following forks and clones. A
 // process that execs a proot is detached at that exec, since proot traces its
@@ -514,14 +514,14 @@ static int execd_proot(pid_t pid) {
     return len < (int)sizeof path && realpath(path, real) && is_proot(real);
 }
 
-// Whether Android's policy traps nr. A SIGSYS for any other call comes from a
-// filter of the program's own, and is its to handle.
-static int policy_traps(int nr) {
+// The error answering nr when Android's policy traps it, or 0. A SIGSYS for
+// any other call comes from a filter of the program's own, and is its to
+// handle.
+static int policy_error(int nr) {
     switch (nr) {
-#define TRAPPED(name) case SYS_##name:
+#define TRAPPED(name, error) case SYS_##name: return error;
 #include "trapped-calls.h"
 #undef TRAPPED
-        return 1;
     default:
         return 0;
     }
@@ -674,12 +674,13 @@ int main(int argc, char **argv) {
             if (t) t->in_entry = 1;
             siginfo_t si;
             struct user_regs_struct regs;
+            int error = 0;
             if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_code == SYS_SECCOMP &&
-                si.si_arch == AUDIT_ARCH_X86_64 && policy_traps(si.si_syscall) &&
+                si.si_arch == AUDIT_ARCH_X86_64 && (error = policy_error(si.si_syscall)) &&
                 get_regs(pid, &regs) == 0) {
-                regs.rax = (unsigned long)-ENOSYS;
+                regs.rax = (unsigned long)-error;
                 ptrace(PTRACE_SETREGS, pid, 0, &regs);
-                if (verbose) fprintf(stderr, "[shim] %d -> ENOSYS\n", si.si_syscall);
+                if (verbose) fprintf(stderr, "[shim] %d -> -%d\n", si.si_syscall, error);
             } else {
                 deliver = signo;
             }
