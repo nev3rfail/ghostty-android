@@ -90,7 +90,7 @@ int main(int argc, char **argv) {
 // The kernel's result for a call it restarts after a signal.
 #define ERESTARTNOINTR 513
 #ifndef SYS_SECCOMP
-#define SYS_SECCOMP 1  // si_code of a SIGSYS the policy raised
+#define SYS_SECCOMP 1  // si_code of a SIGSYS a seccomp filter raised
 #endif
 
 static int verbose;
@@ -392,8 +392,12 @@ struct tracee {
     int in_entry;
     // Its first stop has been handled.
     int started;
-    // Stopped at its first stop, waiting for its parent's fork event.
+    // Stopped at its first stop, waiting for its parent's fork event, and the
+    // signal of that stop, delivered when it starts.
     int held;
+    int held_signal;
+    // Exited before its parent's fork event, which frees the slot.
+    int dead;
     // dup2(fd, fd) is answered by fcntl; the descriptor to report is kept here
     // until the exit stop can substitute it for fcntl's flags.
     long dup2_result;
@@ -427,6 +431,27 @@ static void drop(pid_t pid) {
     if (t) t->pid = 0;
 }
 
+// A slot for a new tracee. Without one its registers and parity cannot be
+// kept, so a tracee beyond MAX_TRACEES is killed.
+static struct tracee *add_new(pid_t pid) {
+    struct tracee *t = add(pid);
+    if (!t) {
+        fprintf(stderr, "syscall-shim: more than %d processes and threads, killing %d\n",
+                MAX_TRACEES, pid);
+        kill(pid, SIGKILL);
+    }
+    return t;
+}
+
+// pid exited. A tracee that has not had its parent's fork event keeps its slot
+// as dead until that event, so the event cannot give the slot to a later
+// process with the same pid.
+static void exited(pid_t pid) {
+    struct tracee *t = find(pid);
+    if (t && (t->started || !t->held)) { t->pid = 0; return; }
+    if (t || (t = add(pid))) { t->held = 0; t->dead = 1; }
+}
+
 static int get_regs(pid_t pid, struct user_regs_struct *r) {
     return ptrace(PTRACE_GETREGS, pid, 0, r);
 }
@@ -449,11 +474,12 @@ static void restore_fork_args(struct tracee *t) {
     ptrace(PTRACE_SETREGS, t->pid, 0, &r);
 }
 
-// Starts a new tracee at its first stop.
-static void start(struct tracee *t) {
+// Starts a new tracee at its first stop, whose signal is signo. That is
+// usually the SIGSTOP every new tracee starts with, which is not delivered.
+static void start(struct tracee *t, int signo) {
     t->started = 1; t->held = 0;
     if (t->fork_saved) restore_fork_args(t);
-    ptrace(PTRACE_SYSCALL, t->pid, 0, 0);
+    ptrace(PTRACE_SYSCALL, t->pid, 0, signo == SIGSTOP ? 0 : signo);
 }
 
 // The linker64 paths, and their realpaths.
@@ -520,7 +546,7 @@ static int execd_proot(pid_t pid) {
 // handle.
 static int policy_error(int nr) {
     switch (nr) {
-#define TRAPPED(name, error) case SYS_##name: return error;
+#define TRAPPED(nr, name, error) case nr: return error;
 #include "trapped-calls.h"
 #undef TRAPPED
     default:
@@ -542,8 +568,9 @@ static long unchanged_ids(int uid, const unsigned long long ids[3]) {
 
 // The result of a call the policy trapped, into *result, or 0 to leave its
 // SIGSYS to the program. The set-id calls succeed when they change no id and
-// get EPERM otherwise, and setfsuid and setfsgid return the current id; every
-// other call gets its error from trapped-calls.h.
+// get EPERM otherwise, setgroups succeeds, and setfsuid and setfsgid return the
+// current id, as proot answers them; every other call gets its error from
+// trapped-calls.h.
 static int trapped_result(int nr, const struct user_regs_struct *r, long *result) {
     int error = policy_error(nr);
     if (!error) return 0;
@@ -558,6 +585,12 @@ static int trapped_result(int nr, const struct user_regs_struct *r, long *result
         *result = unchanged_ids(nr == SYS_setreuid, ids);
         return 1;
     }
+    case SYS_setresuid: case SYS_setresgid: {
+        unsigned long long ids[3] = { r->rdi, r->rsi, r->rdx };
+        *result = unchanged_ids(nr == SYS_setresuid, ids);
+        return 1;
+    }
+    case SYS_setgroups: *result = 0; return 1;
     case SYS_setfsuid: *result = geteuid(); return 1;
     case SYS_setfsgid: *result = getegid(); return 1;
     default: *result = -error; return 1;
@@ -595,13 +628,14 @@ static void syscall_stop(struct tracee *t) {
 // A fork, vfork or clone event in parent, which may be NULL, naming child.
 static void new_child(struct tracee *parent, pid_t child, unsigned event) {
     struct tracee *c = find(child);
-    if (!c && !(c = add(child))) return;
+    if (c && c->dead) { c->pid = 0; return; }
+    if (!c && !(c = add_new(child))) return;
     if (c->started) return;
     if (parent && parent->fork_saved && event == PTRACE_EVENT_FORK) {
         memcpy(c->fork_args, parent->fork_args, sizeof c->fork_args);
         c->fork_saved = 1;
     }
-    if (c->held) start(c);
+    if (c->held) start(c, c->held_signal);
 }
 
 int main(int argc, char **argv) {
@@ -657,12 +691,12 @@ int main(int argc, char **argv) {
 
         if (WIFEXITED(status)) {
             if (pid == child) { exit_code = WEXITSTATUS(status); break; }
-            drop(pid);
+            exited(pid);
             continue;
         }
         if (WIFSIGNALED(status)) {
             if (pid == child) { exit_code = 128 + WTERMSIG(status); break; }
-            drop(pid);
+            exited(pid);
             continue;
         }
         if (!WIFSTOPPED(status)) continue;
@@ -672,17 +706,16 @@ int main(int argc, char **argv) {
         unsigned event = (unsigned)status >> 16;
         int deliver = 0;
 
-        if (!t && (t = add(pid)) && signo == SIGSTOP) {
+        // A dead slot names an earlier process with this pid.
+        if (t && t->dead) { t->pid = 0; t = NULL; }
+        if (!t) {
             // A new tracee's first stop, which can arrive before its parent's
             // fork event. It waits for that event, which says whether it has
             // fork's registers to restore.
-            t->held = 1;
+            if ((t = add_new(pid))) { t->held = 1; t->held_signal = signo; }
             continue;
         }
-        if (t && !t->started) {
-            if (signo == SIGSTOP) { start(t); continue; }
-            t->started = 1;
-        }
+        if (!t->started) { start(t, signo); continue; }
 
         if (signo == SIGTRAP && event) {
             unsigned long msg = 0;

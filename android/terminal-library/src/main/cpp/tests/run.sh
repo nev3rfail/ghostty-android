@@ -53,11 +53,24 @@ ok "another program stays traced" \
   '[ "$(shim exec "$W/other" other)" -gt 0 ]'
 
 # trapped-calls.h holds the x86_64 entries of the superproject's trapped-call
-# list, EPERM where the list marks it and ENOSYS otherwise.
-list=$(git -C "$here" rev-parse --show-superproject-working-tree)/app/src/main/cpp/proot/trapped-calls.txt
-ok "trapped-calls.h matches $list" \
-  '[ -f "$list" ] && [ "$(awk '\''$1 == "x86_64" { print $2, ($3 == "EPERM" ? "EPERM" : "ENOSYS") }'\'' "$list" | sort)" = \
-     "$(sed -n '\''s/^TRAPPED(\(.*\), \(.*\))$/\1 \2/p'\'' "$here/../trapped-calls.h" | sort)" ]'
+# list, EPERM where the list marks it and ENOSYS otherwise, with each number as
+# the host headers have it when they name the call.
+H=$here/../trapped-calls.h
+{
+  echo '#include <sys/syscall.h>'
+  sed -n 's/^TRAPPED(\([0-9]*\), \([a-z0-9_]*\), .*)$/#ifdef SYS_\2\n_Static_assert(SYS_\2 == \1, "\2");\n#endif/p' "$H"
+} > "$W/numbers.c"
+ok "trapped-calls.h numbers match the host headers" \
+  '$CC -fsyntax-only "$W/numbers.c" && [ "$(grep -c _Static_assert "$W/numbers.c")" -gt 0 ]'
+super=$(git -C "$here" rev-parse --show-superproject-working-tree 2>/dev/null)
+list=$super/app/src/main/cpp/proot/trapped-calls.txt
+if [ -n "$super" ] && [ -f "$list" ]; then
+  ok "trapped-calls.h matches $list" \
+    '[ "$(awk '\''$1 == "x86_64" { print $2, ($3 == "EPERM" ? "EPERM" : "ENOSYS") }'\'' "$list" | sort)" = \
+       "$(sed -n '\''s/^TRAPPED([0-9]*, \(.*\), \(.*\))$/\1 \2/p'\'' "$H" | sort)" ]'
+else
+  echo "SKIP: trapped-calls.h against the list: no harness.apk superproject here"
+fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

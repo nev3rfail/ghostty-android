@@ -12,9 +12,9 @@
  *   enosys              a raw uselib returns ENOSYS and a raw acct EPERM, as
  *                       trapped-calls.txt marks them, then a raw getpgrp works
  *   setid               set-id calls that change no id succeed, ones that change
- *                       one get EPERM, and setfsuid and setfsgid return the
- *                       effective ids
- *   own-trap          traps getppid with a filter and handler of its own; the
+ *                       one get EPERM, setgroups succeeds, and setfsuid and
+ *                       setfsgid return the effective ids
+ *   own-trap            traps getppid with a filter and handler of its own; the
  *                       handler runs, then a raw getpgrp works
  *   fork N              N raw forks, checking the argument registers in parent
  *                       and child
@@ -53,7 +53,7 @@ static int install(struct sock_filter *f, unsigned short n) {
 
 static const int legacy[] = {
 	SYS_getpgrp, SYS_fork, SYS_uselib, SYS_acct, SYS_setuid, SYS_setgid,
-	SYS_setreuid, SYS_setregid, SYS_setfsuid, SYS_setfsgid,
+	SYS_setreuid, SYS_setregid, SYS_setfsuid, SYS_setfsgid, SYS_setresgid, SYS_setgroups,
 };
 #define NLEGACY (sizeof legacy / sizeof *legacy)
 
@@ -152,6 +152,8 @@ static int setid(void) {
 	         gives(syscall(SYS_setreuid, u, u + 1), -EPERM) &&
 	         gives(syscall(SYS_setregid, g, g), 0) && gives(syscall(SYS_setregid, -1, -1), 0) &&
 	         gives(syscall(SYS_setregid, g + 1, -1), -EPERM) &&
+	         gives(syscall(SYS_setresgid, g, -1, g), 0) && gives(syscall(SYS_setresgid, -1, g + 1, -1), -EPERM) &&
+	         gives(syscall(SYS_setgroups, 0, 0), 0) &&
 	         gives(syscall(SYS_setfsuid, u + 7), eu) && gives(syscall(SYS_setfsgid, g + 7), eg));
 }
 
