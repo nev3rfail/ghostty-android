@@ -2,15 +2,21 @@
 //
 // Android grants an app an allowlist of syscalls covering what bionic calls,
 // and bionic only ever uses the `*at` variants. Anything else -- `access`,
-// `poll`, `pipe`, `dup2`, `unlink` -- is answered with SECCOMP_RET_KILL_PROCESS.
-// A runtime built for ordinary Linux uses those freely, and dies on the first
-// one. Patching its libc is not enough, because a runtime like Bun issues some
-// syscalls directly rather than through libc.
+// `poll`, `pipe`, `dup2`, `unlink`, `fork` -- the policy traps: the call does
+// not run and the process gets SIGSYS, which kills it. A runtime built for
+// ordinary Linux uses those freely. Patching its libc is not enough, because a
+// runtime like Bun issues some syscalls directly rather than through libc.
 //
 // The kernel runs the ptrace syscall-entry stop *before* it evaluates seccomp,
 // specifically so a tracer's changes are the ones the filter judges. So a
 // tracer that rewrites the legacy call into its `*at` equivalent -- inserting
-// AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits.
+// AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits. A
+// trapped call with no translation returns ENOSYS instead of raising SIGSYS.
+//
+// The shim traces the whole tree it starts, following forks and clones. A
+// process that execs a proot is detached at that exec, since proot traces its
+// own children. proot translates legacy calls too, but it also resolves every
+// path a call names, a per-call cost the shim keeps off the rest of the tree.
 //
 // This is for x86_64. The aarch64 Linux ABI never had the legacy syscalls, so
 // there is nothing to translate there and nothing to run this for.
@@ -18,6 +24,8 @@
 //   syscall-shim <program> [args...]
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -46,10 +54,6 @@ int main(int argc, char **argv) {
 
 #else
 
-#define AT_FDCWD (-100)
-#define AT_SYMLINK_NOFOLLOW 0x100
-#define AT_REMOVEDIR 0x200
-
 // Legacy x86_64 syscall numbers.
 #define NR_lstat         6
 #define NR_poll          7
@@ -76,8 +80,15 @@ int main(int argc, char **argv) {
 #define NR_lchown        94
 #define NR_accept        43
 #define NR_faccessat2    439
+#define NR_fork          57  // musl's _Fork issues it
 
 #define O_CREAT_WRONLY_TRUNC 0x241  // O_WRONLY|O_CREAT|O_TRUNC
+
+// The kernel's result for a call it restarts after a signal.
+#define ERESTARTNOINTR 513
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1  // si_code of a SIGSYS the policy raised
+#endif
 
 static int verbose;
 
@@ -333,6 +344,11 @@ static int translate_legacy(pid_t pid, struct user_regs_struct *r) {
         r->rsi = 0;
         return 1;
 
+    case NR_fork:  // fork(void)
+        r->orig_rax = SYS_clone;
+        r->rdi = SIGCHLD; r->rsi = 0; r->rdx = 0; r->r10 = 0; r->r8 = 0;
+        return 1;
+
     default:
         (void)a3;
         return 0;
@@ -342,7 +358,7 @@ static int translate_legacy(pid_t pid, struct user_regs_struct *r) {
 // Points a path-taking syscall at the stand-in /etc, if that is what it asked
 // for. Runs after the legacy rewrite, so it sees the final syscall number.
 static int redirect_paths(pid_t pid, struct user_regs_struct *r) {
-    unsigned long *slot = NULL;
+    __typeof__(r->rdi) *slot = NULL;
     switch ((long)r->orig_rax) {
     case SYS_open: case SYS_stat: case SYS_readlink:
         slot = &r->rdi; break;
@@ -366,25 +382,174 @@ static int translate(pid_t pid, struct user_regs_struct *r) {
 }
 
 #define MAX_TRACEES 512
-static pid_t tracee[MAX_TRACEES];
-static int in_entry[MAX_TRACEES];
-// dup2(fd, fd) is answered by fcntl; the descriptor to report is kept here
-// until the exit stop can substitute it for fcntl's flags.
-static long dup2_result[MAX_TRACEES];
 
-static int slot_for(pid_t pid) {
-    for (int i = 0; i < MAX_TRACEES; i++) if (tracee[i] == pid) return i;
-    for (int i = 0; i < MAX_TRACEES; i++) {
-        if (tracee[i] == 0) {
-            tracee[i] = pid; in_entry[i] = 1; dup2_result[i] = -1;
-            return i;
-        }
+struct tracee {
+    pid_t pid;  // 0 for a free slot
+    // The next syscall stop is an entry.
+    int in_entry;
+    // Its first stop has been handled.
+    int started;
+    // Stopped at its first stop, waiting for its parent's fork event.
+    int held;
+    // dup2(fd, fd) is answered by fcntl; the descriptor to report is kept here
+    // until the exit stop can substitute it for fcntl's flags.
+    long dup2_result;
+    // fork runs as clone, which takes other arguments. The caller's argument
+    // registers are kept here and put back where fork returns, since the
+    // system-call ABI preserves them: in the parent at its exit stop, and in
+    // the child, which gets a copy, at its first stop.
+    int fork_saved;
+    unsigned long long fork_args[6];
+};
+
+static struct tracee tracees[MAX_TRACEES];
+
+static struct tracee *find(pid_t pid) {
+    for (int i = 0; i < MAX_TRACEES; i++)
+        if (tracees[i].pid == pid) return &tracees[i];
+    return NULL;
+}
+
+static struct tracee *add(pid_t pid) {
+    struct tracee *t = find(0);
+    if (t) {
+        memset(t, 0, sizeof *t);
+        t->pid = pid; t->in_entry = 1; t->dup2_result = -1;
     }
-    return -1;
+    return t;
+}
+
+static void drop(pid_t pid) {
+    struct tracee *t = find(pid);
+    if (t) t->pid = 0;
 }
 
 static int get_regs(pid_t pid, struct user_regs_struct *r) {
     return ptrace(PTRACE_GETREGS, pid, 0, r);
+}
+
+static void save_fork_args(struct tracee *t, const struct user_regs_struct *r) {
+    t->fork_args[0] = r->rdi; t->fork_args[1] = r->rsi; t->fork_args[2] = r->rdx;
+    t->fork_args[3] = r->r10; t->fork_args[4] = r->r8;  t->fork_args[5] = r->r9;
+    t->fork_saved = 1;
+}
+
+static void restore_fork_args(struct tracee *t) {
+    struct user_regs_struct r;
+    t->fork_saved = 0;
+    if (get_regs(t->pid, &r) != 0) return;
+    r.rdi = t->fork_args[0]; r.rsi = t->fork_args[1]; r.rdx = t->fork_args[2];
+    r.r10 = t->fork_args[3]; r.r8 = t->fork_args[4];  r.r9 = t->fork_args[5];
+    // A clone interrupted by a signal is restarted from orig_rax, with the
+    // registers restored here, so it restarts as the fork it was.
+    if ((long)r.rax == -ERESTARTNOINTR) r.orig_rax = NR_fork;
+    ptrace(PTRACE_SETREGS, t->pid, 0, &r);
+}
+
+// Starts a new tracee at its first stop.
+static void start(struct tracee *t) {
+    t->started = 1; t->held = 0;
+    if (t->fork_saved) restore_fork_args(t);
+    ptrace(PTRACE_SYSCALL, t->pid, 0, 0);
+}
+
+// The linker64 paths, and their realpaths.
+#ifndef SHIM_LINKERS
+#define SHIM_LINKERS "/system/bin/linker64", "/apex/com.android.runtime/bin/linker64", \
+                     "/system/bin/bootstrap/linker64"
+#endif
+static const char *const linker_paths[] = { SHIM_LINKERS };
+static char linkers[sizeof linker_paths / sizeof *linker_paths][PATH_MAX];
+// libproot.so, beside this program.
+static char proot_lib[PATH_MAX];
+static const char *prefix;
+
+static void find_proots(void) {
+    for (size_t i = 0; i < sizeof linkers / sizeof *linkers; i++)
+        if (!realpath(linker_paths[i], linkers[i])) linkers[i][0] = '\0';
+    char *slash = realpath("/proc/self/exe", proot_lib) ? strrchr(proot_lib, '/') : NULL;
+    if (slash && (size_t)(slash - proot_lib) + sizeof "/libproot.so" <= sizeof proot_lib)
+        strcpy(slash, "/libproot.so");
+    else
+        proot_lib[0] = '\0';
+    prefix = getenv("HARNESS_PREFIX");
+}
+
+// Whether real, a realpath, is libproot.so or $HARNESS_PREFIX/bin/proot.
+static int is_proot(const char *real) {
+    char bin[PATH_MAX], path[PATH_MAX];
+    if (proot_lib[0] && !strcmp(real, proot_lib)) return 1;
+    if (!prefix || snprintf(bin, sizeof bin, "%s/bin/proot", prefix) >= (int)sizeof bin)
+        return 0;
+    return realpath(bin, path) && !strcmp(real, path);
+}
+
+// Whether the program pid has just exec'd is a proot: run itself, or run by
+// linker64 as its argv[1], which is resolved against pid's working directory.
+static int execd_proot(pid_t pid) {
+    char path[PATH_MAX], real[PATH_MAX], cmdline[PATH_MAX];
+    snprintf(path, sizeof path, "/proc/%d/exe", pid);
+    if (!realpath(path, real)) return 0;
+    if (is_proot(real)) return 1;
+
+    int linker = 0;
+    for (size_t i = 0; i < sizeof linkers / sizeof *linkers; i++)
+        if (linkers[i][0] && !strcmp(real, linkers[i])) linker = 1;
+    if (!linker) return 0;
+
+    snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, cmdline, sizeof cmdline - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    cmdline[n] = '\0';
+    size_t argv0 = strlen(cmdline);
+    if ((ssize_t)argv0 + 1 >= n) return 0;
+    const char *arg1 = cmdline + argv0 + 1;
+    int len = arg1[0] == '/' ? snprintf(path, sizeof path, "%s", arg1)
+                             : snprintf(path, sizeof path, "/proc/%d/cwd/%s", pid, arg1);
+    return len < (int)sizeof path && realpath(path, real) && is_proot(real);
+}
+
+// One syscall stop: the entry rewrites the call, the exit fixes up its result.
+static void syscall_stop(struct tracee *t) {
+    struct user_regs_struct regs;
+    if (t->in_entry) {
+        if (get_regs(t->pid, &regs) == 0) {
+            struct user_regs_struct asked = regs;
+            if (translate(t->pid, &regs)) {
+                ptrace(PTRACE_SETREGS, t->pid, 0, &regs);
+                if ((long)asked.orig_rax == NR_dup2 && (long)regs.orig_rax == SYS_fcntl)
+                    t->dup2_result = (long)asked.rdi;
+                if ((long)asked.orig_rax == NR_fork) save_fork_args(t, &asked);
+                if (verbose)
+                    fprintf(stderr, "[shim] %ld -> %ld\n",
+                            (long)asked.orig_rax, (long)regs.orig_rax);
+            }
+        }
+    } else if (t->fork_saved) {
+        restore_fork_args(t);
+    } else if (t->dup2_result >= 0) {
+        if (get_regs(t->pid, &regs) == 0 && (long)regs.rax >= 0) {
+            regs.rax = (unsigned long)t->dup2_result;
+            ptrace(PTRACE_SETREGS, t->pid, 0, &regs);
+        }
+        t->dup2_result = -1;
+    }
+    t->in_entry = !t->in_entry;
+}
+
+// A fork, vfork or clone event in parent, which may be NULL, naming child.
+static void new_child(struct tracee *parent, pid_t child, unsigned event) {
+    struct tracee *c = find(child);
+    if (!c && !(c = add(child))) return;
+    if (c->started) return;
+    if (parent && parent->fork_saved && event == PTRACE_EVENT_FORK) {
+        memcpy(c->fork_args, parent->fork_args, sizeof c->fork_args);
+        c->fork_saved = 1;
+    }
+    if (c->held) start(c);
 }
 
 int main(int argc, char **argv) {
@@ -420,10 +585,14 @@ int main(int argc, char **argv) {
 
     int status;
     waitpid(child, &status, 0);
+    // A syscall stop is SIGTRAP | 0x80, apart from a SIGTRAP sent to the
+    // program. An exec is reported as an event stop.
     ptrace(PTRACE_SETOPTIONS, child, 0,
            PTRACE_O_EXITKILL | PTRACE_O_TRACECLONE |
-           PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK);
-    slot_for(child);
+           PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+           PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC);
+    find_proots();
+    add(child)->started = 1;
     ptrace(PTRACE_SYSCALL, child, 0, 0);
 
     int exit_code = 0;
@@ -436,48 +605,67 @@ int main(int argc, char **argv) {
 
         if (WIFEXITED(status)) {
             if (pid == child) { exit_code = WEXITSTATUS(status); break; }
-            int s = slot_for(pid); if (s >= 0) tracee[s] = 0;
+            drop(pid);
             continue;
         }
         if (WIFSIGNALED(status)) {
             if (pid == child) { exit_code = 128 + WTERMSIG(status); break; }
-            int s = slot_for(pid); if (s >= 0) tracee[s] = 0;
+            drop(pid);
             continue;
         }
         if (!WIFSTOPPED(status)) continue;
 
-        int slot = slot_for(pid);
+        struct tracee *t = find(pid);
         int signo = WSTOPSIG(status);
+        unsigned event = (unsigned)status >> 16;
         int deliver = 0;
 
-        if (signo == SIGTRAP) {
-            unsigned event = (unsigned)status >> 16;
-            if (event) {
-                // A clone/fork/vfork report; the new tracee arrives on its own.
-            } else if (slot >= 0) {
-                struct user_regs_struct regs;
-                if (in_entry[slot]) {
-                    if (get_regs(pid, &regs) == 0) {
-                        long original = (long)regs.orig_rax;
-                        if (translate(pid, &regs)) {
-                            ptrace(PTRACE_SETREGS, pid, 0, &regs);
-                            if (original == NR_dup2 && regs.orig_rax == SYS_fcntl)
-                                dup2_result[slot] = (long)regs.rdi;
-                            if (verbose)
-                                fprintf(stderr, "[shim] %ld -> %ld\n",
-                                        original, (long)regs.orig_rax);
-                        }
-                    }
-                } else if (dup2_result[slot] >= 0) {
-                    if (get_regs(pid, &regs) == 0) {
-                        if ((long)regs.rax >= 0) {
-                            regs.rax = (unsigned long)dup2_result[slot];
-                            ptrace(PTRACE_SETREGS, pid, 0, &regs);
-                        }
-                    }
-                    dup2_result[slot] = -1;
+        if (!t && (t = add(pid)) && signo == SIGSTOP) {
+            // A new tracee's first stop, which can arrive before its parent's
+            // fork event. It waits for that event, which says whether it has
+            // fork's registers to restore.
+            t->held = 1;
+            continue;
+        }
+        if (t && !t->started) {
+            if (signo == SIGSTOP) { start(t); continue; }
+            t->started = 1;
+        }
+
+        if (signo == SIGTRAP && event) {
+            unsigned long msg = 0;
+            ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+            if (event == PTRACE_EVENT_EXEC) {
+                // A thread other than the leader that execs takes the leader's
+                // pid; msg is its former one, which reports no exit.
+                if ((pid_t)msg != pid) drop((pid_t)msg);
+                if (t) { t->in_entry = 0; t->dup2_result = -1; t->fork_saved = 0; }
+                // proot has not forked yet, so it starts untraced and can trace
+                // its own children.
+                if (execd_proot(pid)) {
+                    if (verbose) fprintf(stderr, "[shim] detached proot %d\n", pid);
+                    drop(pid);
+                    ptrace(PTRACE_DETACH, pid, 0, 0);
+                    continue;
                 }
-                in_entry[slot] = !in_entry[slot];
+            } else if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
+                       event == PTRACE_EVENT_CLONE) {
+                new_child(t, (pid_t)msg, event);
+            }
+        } else if (signo == (SIGTRAP | 0x80)) {
+            if (t) syscall_stop(t);
+        } else if (signo == SIGSYS) {
+            // The kernel may report no exit stop for a trapped call.
+            if (t) t->in_entry = 1;
+            siginfo_t si;
+            struct user_regs_struct regs;
+            if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_code == SYS_SECCOMP &&
+                get_regs(pid, &regs) == 0) {
+                regs.rax = (unsigned long)-ENOSYS;
+                ptrace(PTRACE_SETREGS, pid, 0, &regs);
+                if (verbose) fprintf(stderr, "[shim] %d -> ENOSYS\n", si.si_syscall);
+            } else {
+                deliver = signo;
             }
         } else if (signo != SIGSTOP) {
             deliver = signo;
