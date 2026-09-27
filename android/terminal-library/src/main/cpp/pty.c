@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -87,6 +89,16 @@ static void sane_termios(struct termios *tios) {
     tios->c_cc[VTIME] = 0;
 }
 
+/// Closes every descriptor above 2: by close_range(2) where the kernel has it
+/// (5.9), otherwise one by one up to the descriptor limit.
+static void close_descriptors_above_stderr(void) {
+    if (syscall(__NR_close_range, 3, ~0U, 0) == 0) return;
+    struct rlimit limit;
+    int max = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY
+            ? (int)limit.rlim_cur : 65536;
+    for (int fd = 3; fd < max; fd++) close(fd);
+}
+
 JNIEXPORT jint JNICALL
 Java_com_ghostty_android_terminal_PtyNative_spawn(
         JNIEnv *env, jobject thiz,
@@ -148,6 +160,12 @@ Java_com_ghostty_android_terminal_PtyNative_spawn(
         sigemptyset(&empty);
         sigprocmask(SIG_SETMASK, &empty, NULL);
         for (int signo = 1; signo < NSIG; signo++) signal(signo, SIG_DFL);
+
+        // Every descriptor the JVM had open is inherited, and most carry no
+        // close-on-exec: a pipe to a child that another thread is starting keeps
+        // its reader waiting for an end of file that never comes while the
+        // shell lives. The shell gets the pty and nothing else.
+        close_descriptors_above_stderr();
 
         if (cwd_path != NULL) {
             if (chdir(cwd_path) != 0) {
