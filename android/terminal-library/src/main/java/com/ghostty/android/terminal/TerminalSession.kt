@@ -27,10 +27,17 @@ class TerminalSession(
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + Job())
 
+    @Volatile
     private var pty: Pty? = null
 
     private val _isRunning = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+
+    /**
+     * The pid of the process on the terminal, which leads the terminal's
+     * session, or null before it starts and after it is hung up.
+     */
+    val pid: Int? get() = pty?.pid
 
     /**
      * Start the process and stream its output.
