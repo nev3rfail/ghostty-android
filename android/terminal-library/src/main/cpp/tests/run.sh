@@ -35,6 +35,7 @@ shim() { timeout 60 "$S" "$T" "$@"; }
 ok "syscall-stop parity across execs and a raised SIGTRAP" 'shim trap parity 3'
 ok "execs from threads other than the leader" 'shim trap thread-exec 600'
 ok "ENOSYS and EPERM for untranslated trapped calls, then a translated one" 'shim trap enosys'
+ok "set-id calls by P4's rule" 'shim trap setid'
 ok "a program's own SIGSYS for a call the policy allows" 'shim trap own-trap'
 # Enough forks for some child to stop before its parent's fork event.
 ok "fork keeps the argument registers in parent and child" 'shim trap fork 3000'

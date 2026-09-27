@@ -11,8 +11,9 @@
 // specifically so a tracer's changes are the ones the filter judges. So a
 // tracer that rewrites the legacy call into its `*at` equivalent -- inserting
 // AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits. A
-// call the policy traps with no translation returns an error instead of raising
-// SIGSYS: EPERM or ENOSYS, as trapped-calls.h lists it.
+// call the policy traps with no translation is answered instead of raising
+// SIGSYS: the set-id calls by proot's rule, the rest with EPERM or ENOSYS, as
+// trapped-calls.h lists it.
 //
 // The shim traces the whole tree it starts, following forks and clones. A
 // process that execs a proot is detached at that exec, since proot traces its
@@ -527,6 +528,42 @@ static int policy_error(int nr) {
     }
 }
 
+// 0 when every id names the current one or is -1, -EPERM otherwise; uid tells
+// user ids from group ids. The shim's ids are its tracees'.
+static long unchanged_ids(int uid, const unsigned long long ids[3]) {
+    unsigned current[3];
+    int status = uid ? getresuid(&current[0], &current[1], &current[2])
+                     : getresgid(&current[0], &current[1], &current[2]);
+    if (status < 0) return -EPERM;
+    for (int i = 0; i < 3; i++)
+        if ((unsigned)ids[i] != (unsigned)-1 && (unsigned)ids[i] != current[i]) return -EPERM;
+    return 0;
+}
+
+// The result of a call the policy trapped, into *result, or 0 to leave its
+// SIGSYS to the program. The set-id calls succeed when they change no id and
+// get EPERM otherwise, and setfsuid and setfsgid return the current id; every
+// other call gets its error from trapped-calls.h.
+static int trapped_result(int nr, const struct user_regs_struct *r, long *result) {
+    int error = policy_error(nr);
+    if (!error) return 0;
+    switch (nr) {
+    case SYS_setuid: case SYS_setgid: {
+        unsigned long long ids[3] = { r->rdi, r->rdi, r->rdi };
+        *result = unchanged_ids(nr == SYS_setuid, ids);
+        return 1;
+    }
+    case SYS_setreuid: case SYS_setregid: {
+        unsigned long long ids[3] = { r->rdi, r->rsi, (unsigned)-1 };
+        *result = unchanged_ids(nr == SYS_setreuid, ids);
+        return 1;
+    }
+    case SYS_setfsuid: *result = geteuid(); return 1;
+    case SYS_setfsgid: *result = getegid(); return 1;
+    default: *result = -error; return 1;
+    }
+}
+
 // One syscall stop: the entry rewrites the call, the exit fixes up its result.
 static void syscall_stop(struct tracee *t) {
     struct user_regs_struct regs;
@@ -674,13 +711,13 @@ int main(int argc, char **argv) {
             if (t) t->in_entry = 1;
             siginfo_t si;
             struct user_regs_struct regs;
-            int error = 0;
+            long result;
             if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_code == SYS_SECCOMP &&
-                si.si_arch == AUDIT_ARCH_X86_64 && (error = policy_error(si.si_syscall)) &&
-                get_regs(pid, &regs) == 0) {
-                regs.rax = (unsigned long)-error;
+                si.si_arch == AUDIT_ARCH_X86_64 && get_regs(pid, &regs) == 0 &&
+                trapped_result(si.si_syscall, &regs, &result)) {
+                regs.rax = (unsigned long)result;
                 ptrace(PTRACE_SETREGS, pid, 0, &regs);
-                if (verbose) fprintf(stderr, "[shim] %d -> -%d\n", si.si_syscall, error);
+                if (verbose) fprintf(stderr, "[shim] %d -> %ld\n", si.si_syscall, result);
             } else {
                 deliver = signo;
             }

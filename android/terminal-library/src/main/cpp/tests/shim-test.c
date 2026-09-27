@@ -2,15 +2,19 @@
  * The tracee side of run.sh: each mode checks one thing the shim does and exits
  * 0 when it holds.
  *
- *   trap MODE ARGS...   traps getpgrp, fork, uselib and acct the way Android's
- *                       policy does, then runs MODE ARGS... in this program
+ *   trap MODE ARGS...   traps getpgrp, fork, uselib, acct and the set-id calls
+ *                       the way Android's policy does, then runs MODE ARGS...
+ *                       in this program
  *   parity N            a raw getpgrp and a raised SIGTRAP, then N execs of
  *                       itself that do the same
  *   thread-exec N       N execs, each from a thread other than the leader, each
  *                       thread making a raw getpgrp first
  *   enosys              a raw uselib returns ENOSYS and a raw acct EPERM, as
  *                       trapped-calls.txt marks them, then a raw getpgrp works
- *   own-trap            traps getppid with a filter and handler of its own; the
+ *   setid               set-id calls that change no id succeed, ones that change
+ *                       one get EPERM, and setfsuid and setfsgid return the
+ *                       effective ids
+ *   own-trap          traps getppid with a filter and handler of its own; the
  *                       handler runs, then a raw getpgrp works
  *   fork N              N raw forks, checking the argument registers in parent
  *                       and child
@@ -47,17 +51,22 @@ static int install(struct sock_filter *f, unsigned short n) {
 	       syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
 }
 
+static const int legacy[] = {
+	SYS_getpgrp, SYS_fork, SYS_uselib, SYS_acct, SYS_setuid, SYS_setgid,
+	SYS_setreuid, SYS_setregid, SYS_setfsuid, SYS_setfsgid,
+};
+#define NLEGACY (sizeof legacy / sizeof *legacy)
+
 static int trap_legacy(void) {
-	struct sock_filter f[] = {
-		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpgrp, 4, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fork, 3, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_uselib, 2, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_acct, 1, 0),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-	};
-	return install(f, sizeof f / sizeof *f);
+	struct sock_filter f[NLEGACY + 3];
+	unsigned short n = 0;
+	f[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+	for (size_t i = 0; i < NLEGACY; i++)
+		f[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, legacy[i],
+		                                      (unsigned char)(NLEGACY - i), 0);
+	f[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+	f[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+	return install(f, n);
 }
 
 static volatile sig_atomic_t own_sigsys;
@@ -128,6 +137,22 @@ static int enosys(void) {
 	errno = 0;
 	if (syscall(SYS_acct, 0) != -1 || errno != EPERM) return 1;
 	return !raw_getpgrp();
+}
+
+/* Whether a raw call returns want: 0 or a result, or -EPERM for an EPERM. */
+static int gives(long ret, long want) {
+	return want == -EPERM ? ret == -1 && errno == EPERM : ret == want;
+}
+
+static int setid(void) {
+	long u = getuid(), g = getgid(), eu = geteuid(), eg = getegid();
+	return !(gives(syscall(SYS_setuid, u), 0) && gives(syscall(SYS_setuid, u + 1), -EPERM) &&
+	         gives(syscall(SYS_setgid, g), 0) && gives(syscall(SYS_setgid, g + 1), -EPERM) &&
+	         gives(syscall(SYS_setreuid, u, u), 0) && gives(syscall(SYS_setreuid, -1, -1), 0) &&
+	         gives(syscall(SYS_setreuid, u, u + 1), -EPERM) &&
+	         gives(syscall(SYS_setregid, g, g), 0) && gives(syscall(SYS_setregid, -1, -1), 0) &&
+	         gives(syscall(SYS_setregid, g + 1, -1), -EPERM) &&
+	         gives(syscall(SYS_setfsuid, u + 7), eu) && gives(syscall(SYS_setfsgid, g + 7), eg));
 }
 
 /* fork with every argument register set; returns its result and the registers
@@ -216,5 +241,6 @@ int main(int argc, char **argv) {
 	if (argc > 2 && !strcmp(argv[1], "fork-interrupted")) return forks_interrupted(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "enosys")) return enosys();
 	if (argc > 1 && !strcmp(argv[1], "own-trap")) return own_trap();
+	if (argc > 1 && !strcmp(argv[1], "setid")) return setid();
 	return tracer_pid();
 }
