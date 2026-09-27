@@ -18,7 +18,6 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -89,10 +88,10 @@ static void sane_termios(struct termios *tios) {
     tios->c_cc[VTIME] = 0;
 }
 
-/// Closes every descriptor above 2: by close_range(2) where the kernel has it
-/// (5.9), otherwise one by one up to the descriptor limit.
+/// Closes every descriptor above 2, one close(2) each up to the descriptor
+/// limit: the app seccomp policy of Android 11 kills a process that calls
+/// close_range(2) with SIGSYS.
 static void close_descriptors_above_stderr(void) {
-    if (syscall(__NR_close_range, 3, ~0U, 0) == 0) return;
     struct rlimit limit;
     int max = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY
             ? (int)limit.rlim_cur : 65536;
