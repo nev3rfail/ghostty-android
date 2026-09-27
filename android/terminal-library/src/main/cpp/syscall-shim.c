@@ -10,10 +10,13 @@
 // The kernel runs the ptrace syscall-entry stop *before* it evaluates seccomp,
 // specifically so a tracer's changes are the ones the filter judges. So a
 // tracer that rewrites the legacy call into its `*at` equivalent -- inserting
-// AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits. A
-// call the policy traps with no translation is answered instead of raising
-// SIGSYS: the set-id calls by proot's rule, the rest with EPERM or ENOSYS, as
-// trapped-calls.h lists it.
+// AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits.
+// `fork` becomes `clone(SIGCHLD)`, with the argument registers restored in the
+// parent and the child. A call the policy traps with no translation is answered
+// instead of raising SIGSYS: the set-id calls by proot's rule, the rest with
+// EPERM or ENOSYS, as trapped-calls.h lists it. A SIGSYS for a call that list
+// does not name comes from a filter of the program's own, such as Chromium's
+// sandbox, and is delivered to the program.
 //
 // The shim traces the whole tree it starts, following forks and clones. A
 // process that execs a proot is detached at that exec, since proot traces its
