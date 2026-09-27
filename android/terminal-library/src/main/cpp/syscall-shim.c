@@ -11,7 +11,8 @@
 // specifically so a tracer's changes are the ones the filter judges. So a
 // tracer that rewrites the legacy call into its `*at` equivalent -- inserting
 // AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits. A
-// trapped call with no translation returns ENOSYS instead of raising SIGSYS.
+// call the policy traps with no translation returns ENOSYS instead of raising
+// SIGSYS; trapped-calls.h lists them.
 //
 // The shim traces the whole tree it starts, following forks and clones. A
 // process that execs a proot is detached at that exec, since proot traces its
@@ -31,6 +32,7 @@
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
+#include <linux/audit.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
@@ -512,6 +514,19 @@ static int execd_proot(pid_t pid) {
     return len < (int)sizeof path && realpath(path, real) && is_proot(real);
 }
 
+// Whether Android's policy traps nr. A SIGSYS for any other call comes from a
+// filter of the program's own, and is its to handle.
+static int policy_traps(int nr) {
+    switch (nr) {
+#define TRAPPED(name) case SYS_##name:
+#include "trapped-calls.h"
+#undef TRAPPED
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 // One syscall stop: the entry rewrites the call, the exit fixes up its result.
 static void syscall_stop(struct tracee *t) {
     struct user_regs_struct regs;
@@ -660,6 +675,7 @@ int main(int argc, char **argv) {
             siginfo_t si;
             struct user_regs_struct regs;
             if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_code == SYS_SECCOMP &&
+                si.si_arch == AUDIT_ARCH_X86_64 && policy_traps(si.si_syscall) &&
                 get_regs(pid, &regs) == 0) {
                 regs.rax = (unsigned long)-ENOSYS;
                 ptrace(PTRACE_SETREGS, pid, 0, &regs);

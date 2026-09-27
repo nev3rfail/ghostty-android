@@ -35,6 +35,7 @@ shim() { timeout 60 "$S" "$T" "$@"; }
 ok "syscall-stop parity across execs and a raised SIGTRAP" 'shim trap parity 3'
 ok "execs from threads other than the leader" 'shim trap thread-exec 600'
 ok "ENOSYS for an untranslated trapped call, then a translated one" 'shim trap enosys'
+ok "a program's own SIGSYS for a call the policy allows" 'shim trap own-trap'
 # Enough forks for some child to stop before its parent's fork event.
 ok "fork keeps the argument registers in parent and child" 'shim trap fork 3000'
 ok "an interrupted fork restarts as fork" 'shim trap fork-interrupted 2000'
@@ -49,6 +50,12 @@ ok "linker64 running another program stays traced" \
   '[ "$(shim exec "$W/linker64" linker64 "$W/other")" -gt 0 ]'
 ok "another program stays traced" \
   '[ "$(shim exec "$W/other" other)" -gt 0 ]'
+
+# trapped-calls.h holds the x86_64 names of the superproject's trapped-call list.
+list=$(git -C "$here" rev-parse --show-superproject-working-tree)/app/src/main/cpp/proot/trapped-calls.txt
+ok "trapped-calls.h matches $list" \
+  '[ -f "$list" ] && [ "$(awk '\''$1 == "x86_64" { print $2 }'\'' "$list" | sort)" = \
+     "$(sed -n '\''s/^TRAPPED(\(.*\))$/\1/p'\'' "$here/../trapped-calls.h" | sort)" ]'
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

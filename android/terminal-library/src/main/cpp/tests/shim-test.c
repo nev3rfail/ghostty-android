@@ -9,6 +9,8 @@
  *   thread-exec N       N execs, each from a thread other than the leader, each
  *                       thread making a raw getpgrp first
  *   enosys              a raw uselib returns ENOSYS, then a raw getpgrp works
+ *   own-trap            traps getppid with a filter and handler of its own; the
+ *                       handler runs, then a raw getpgrp works
  *   fork N              N raw forks, checking the argument registers in parent
  *                       and child
  *   fork-interrupted N  as fork, in one process, with a timer signal
@@ -34,6 +36,16 @@
 
 static char *self;
 
+static int raw_getpgrp(void) {
+	return syscall(SYS_getpgrp) == getpgid(0);
+}
+
+static int install(struct sock_filter *f, unsigned short n) {
+	struct sock_fprog prog = { n, f };
+	return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+	       syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+}
+
 static int trap_legacy(void) {
 	struct sock_filter f[] = {
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
@@ -43,13 +55,28 @@ static int trap_legacy(void) {
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
 	};
-	struct sock_fprog prog = { sizeof f / sizeof *f, f };
-	return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
-	       syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+	return install(f, sizeof f / sizeof *f);
 }
 
-static int raw_getpgrp(void) {
-	return syscall(SYS_getpgrp) == getpgid(0);
+static volatile sig_atomic_t own_sigsys;
+static void on_sigsys(int sig, siginfo_t *si, void *uc) {
+	(void)sig; (void)uc;
+	if (si->si_syscall == SYS_getppid) own_sigsys = 1;
+}
+
+/* A program's own filter, trapping a call the policy allows, and its own
+ * SIGSYS handler. */
+static int own_trap(void) {
+	struct sock_filter f[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+	};
+	struct sigaction sa = { .sa_sigaction = on_sigsys, .sa_flags = SA_SIGINFO };
+	if (sigaction(SIGSYS, &sa, 0) || install(f, sizeof f / sizeof *f)) return 1;
+	syscall(SYS_getppid);
+	return !own_sigsys || !raw_getpgrp();
 }
 
 static void reexec(const char *mode, int n) {
@@ -184,5 +211,6 @@ int main(int argc, char **argv) {
 	if (argc > 2 && !strcmp(argv[1], "fork")) return forks(atoi(argv[2]));
 	if (argc > 2 && !strcmp(argv[1], "fork-interrupted")) return forks_interrupted(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "enosys")) return enosys();
+	if (argc > 1 && !strcmp(argv[1], "own-trap")) return own_trap();
 	return tracer_pid();
 }
