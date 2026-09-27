@@ -83,17 +83,19 @@ class TerminalSession(
                 onOutput(buffer, count)
             }
 
-            // The session stops naming the process before it is reaped: until the
-            // wait below, the pid is a zombie nothing else can be given, and after
-            // it the pid may belong to another process. The terminal it ran on is
-            // closed with it, and signals nothing.
+            // The end of output says every holder of the terminal closed it, not
+            // that the process exited: one that redirected its streams elsewhere
+            // is still running, and a hang-up is still owed to it. So the session
+            // names the process until it is reaped, then stops, since the pid may
+            // belong to another process after; the terminal is closed without a
+            // signal.
+            val status = started.waitFor()
             synchronized(this@TerminalSession) {
                 if (pty === started) {
                     runCatching { started.release() }
                     pty = null
                 }
             }
-            val status = started.waitFor()
             _isRunning.value = false
             Log.d(TAG, "Process ${started.pid} exited with status $status")
             onExit(status)
