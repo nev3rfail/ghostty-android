@@ -15,11 +15,14 @@
 // parent and the child. Below 4.8 seccomp runs first, so the legacy call is
 // trapped before the entry stop; the shim then rewrites it at its SIGSYS and
 // restarts it as the translation. The same restart translates the calls only
-// an older policy traps, such as `open`. A call the policy traps with no
-// translation is answered instead of raising SIGSYS: the set-id calls by
-// proot's rule, the rest with EPERM or ENOSYS, as trapped-calls.h lists it. A
-// SIGSYS for a call that list does not name comes from a filter of the
-// program's own, such as Chromium's sandbox, and is delivered to the program.
+// an older policy traps, such as `open` and `readlink`. A call the policy traps
+// with no translation is answered instead of raising SIGSYS: the set-id calls
+// by proot's rule, the rest with EPERM or ENOSYS, as trapped-calls.h lists it,
+// and the newer calls only an older policy traps, such as `membarrier`, with
+// ENOSYS; those two, the restart and the older policy's answer, only for a
+// trap with no filter data, as Android's policy sets none. A SIGSYS for any
+// other call comes from a filter of the program's own, such as Chromium's
+// sandbox, and is delivered to the program.
 //
 // The shim traces the whole tree it starts, following forks and clones. A
 // process that execs a proot is detached at that exec, since proot traces its
@@ -379,6 +382,11 @@ static int translate_old_policy(struct user_regs_struct *r) {
         r->rdi = (unsigned long)AT_FDCWD; r->rsi = a0; r->rdx = a1; r->r10 = a2;
         return 1;
 
+    case SYS_readlink:  // readlink(path, buf, size)
+        r->orig_rax = SYS_readlinkat;
+        r->rdi = (unsigned long)AT_FDCWD; r->rsi = a0; r->rdx = a1; r->r10 = a2;
+        return 1;
+
     default:
         return 0;
     }
@@ -593,6 +601,25 @@ static int policy_error(int nr) {
 #define TRAPPED(nr, name, error) case nr: return error;
 #include "trapped-calls.h"
 #undef TRAPPED
+    default:
+        return 0;
+    }
+}
+
+// The error answering nr when only an older policy traps it, such as
+// membarrier below API 30, or 0: ENOSYS, what a kernel without the call gives,
+// for calls a runtime probes and does without. The numbers are the x86_64
+// ABI's, as in trapped-calls.h.
+static int old_policy_error(int nr) {
+    switch (nr) {
+    case 324:  // membarrier
+    case 326:  // copy_file_range
+    case 327:  // preadv2
+    case 328:  // pwritev2
+    case 332:  // statx
+    case 434:  // pidfd_open
+    case 438:  // pidfd_getfd
+        return ENOSYS;
     default:
         return 0;
     }
@@ -842,6 +869,11 @@ int main(int argc, char **argv) {
                 regs.rax = (unsigned long)result;
                 ptrace(PTRACE_SETREGS, pid, 0, &regs);
                 if (verbose) fprintf(stderr, "[shim] %d -> %ld\n", si.si_syscall, result);
+            } else if (si.si_errno == 0 && old_policy_error(si.si_syscall)) {
+                regs.rax = (unsigned long)-old_policy_error(si.si_syscall);
+                ptrace(PTRACE_SETREGS, pid, 0, &regs);
+                if (verbose)
+                    fprintf(stderr, "[shim] %d -> %ld\n", si.si_syscall, (long)regs.rax);
             } else {
                 if (verbose) fprintf(stderr, "[shim] SIGSYS for %d delivered\n", si.si_syscall);
                 deliver = signo;
