@@ -2,8 +2,8 @@
  * The tracee side of run.sh: each mode checks one thing the shim does and exits
  * 0 when it holds.
  *
- *   trap MODE ARGS...   traps getpgrp, fork, uselib, acct, epoll_create and the
- *                       set-id calls the way Android's policy does, then runs
+ *   trap MODE ARGS...   traps getpgrp, fork, uselib, acct, epoll_create, open and
+ *                       the set-id calls the way Android's policy does, then runs
  *                       MODE ARGS... in this program
  *   parity N            a raw getpgrp and a raised SIGTRAP, then N execs of
  *                       itself that do the same
@@ -15,10 +15,13 @@
  *   setid               set-id calls that change no id succeed, ones that change
  *                       one get EPERM, setgroups succeeds, and setfsuid and
  *                       setfsgid return the effective ids
+ *   open                a raw open, which the shim translates only once it is
+ *                       trapped, opens this program
  *   epoll               epoll_create gives EINVAL for a size of 0 or less, and
  *                       a descriptor otherwise
- *   own-trap            traps getppid with a filter and handler of its own; the
- *                       handler runs, then a raw getpgrp works
+ *   own-trap            traps getppid, and open with a handler's number, with a
+ *                       filter and handler of its own; the handler runs for
+ *                       both, then a raw getpgrp works
  *   fork N              N raw forks, checking the argument registers in parent
  *                       and child
  *   fork-interrupted N  as fork, in one process, with a timer signal
@@ -28,6 +31,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
@@ -57,7 +61,7 @@ static int install(struct sock_filter *f, unsigned short n) {
 static const int legacy[] = {
 	SYS_getpgrp, SYS_fork, SYS_uselib, SYS_acct, SYS_setuid, SYS_setgid,
 	SYS_setreuid, SYS_setregid, SYS_setfsuid, SYS_setfsgid, SYS_setresgid, SYS_setgroups,
-	SYS_epoll_create,
+	SYS_epoll_create, SYS_open,
 };
 #define NLEGACY (sizeof legacy / sizeof *legacy)
 
@@ -73,25 +77,30 @@ static int trap_legacy(void) {
 	return install(f, n);
 }
 
-static volatile sig_atomic_t own_sigsys;
+static volatile sig_atomic_t own_sigsys, own_open;
 static void on_sigsys(int sig, siginfo_t *si, void *uc) {
 	(void)sig; (void)uc;
 	if (si->si_syscall == SYS_getppid) own_sigsys = 1;
+	if (si->si_syscall == SYS_open && si->si_errno == 1) own_open = 1;
 }
 
-/* A program's own filter, trapping a call the policy allows, and its own
- * SIGSYS handler. */
+/* A program's own filter, trapping a call the policy allows, and open with a
+ * handler's number as the data, as Chromium's sandbox does, and its own SIGSYS
+ * handler. */
 static int own_trap(void) {
 	struct sock_filter f[] = {
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 1, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 2, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_open, 2, 0),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | 1),
 	};
 	struct sigaction sa = { .sa_sigaction = on_sigsys, .sa_flags = SA_SIGINFO };
 	if (sigaction(SIGSYS, &sa, 0) || install(f, sizeof f / sizeof *f)) return 1;
 	syscall(SYS_getppid);
-	return !own_sigsys || !raw_getpgrp();
+	syscall(SYS_open, "/", O_RDONLY, 0);
+	return !own_sigsys || !own_open || !raw_getpgrp();
 }
 
 static void reexec(const char *mode, int n) {
@@ -189,6 +198,13 @@ static int epoll(void) {
 	return syscall(SYS_epoll_create, 1) < 0;
 }
 
+static int raw_open(void) {
+	char path[64];
+	snprintf(path, sizeof path, "/proc/%d/exe", getpid());
+	long fd = syscall(SYS_open, path, O_RDONLY | O_CLOEXEC, 0);
+	return fd < 0 || close((int)fd) || !raw_getpgrp();
+}
+
 /* fork with every argument register set; returns its result and the registers
  * as the call left them. */
 static long raw_fork(const long in[6], long out[6]) {
@@ -276,6 +292,7 @@ int main(int argc, char **argv) {
 	if (argc > 1 && !strcmp(argv[1], "enosys")) return enosys();
 	if (argc > 1 && !strcmp(argv[1], "own-trap")) return own_trap();
 	if (argc > 1 && !strcmp(argv[1], "epoll")) return epoll();
+	if (argc > 1 && !strcmp(argv[1], "open")) return raw_open();
 	if (argc > 2 && !strcmp(argv[1], "threads")) return threads(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "setid")) return setid();
 	return tracer_pid();

@@ -7,16 +7,19 @@
 // ordinary Linux uses those freely. Patching its libc is not enough, because a
 // runtime like Bun issues some syscalls directly rather than through libc.
 //
-// The kernel runs the ptrace syscall-entry stop *before* it evaluates seccomp,
-// specifically so a tracer's changes are the ones the filter judges. So a
+// From Linux 4.8 the kernel runs the ptrace syscall-entry stop *before* it
+// evaluates seccomp, so a tracer's changes are the ones the filter judges. So a
 // tracer that rewrites the legacy call into its `*at` equivalent -- inserting
 // AT_FDCWD, shifting the arguments -- hands seccomp a syscall it permits.
 // `fork` becomes `clone(SIGCHLD)`, with the argument registers restored in the
-// parent and the child. A call the policy traps with no translation is answered
-// instead of raising SIGSYS: the set-id calls by proot's rule, the rest with
-// EPERM or ENOSYS, as trapped-calls.h lists it. A SIGSYS for a call that list
-// does not name comes from a filter of the program's own, such as Chromium's
-// sandbox, and is delivered to the program.
+// parent and the child. Below 4.8 seccomp runs first, so the legacy call is
+// trapped before the entry stop; the shim then rewrites it at its SIGSYS and
+// restarts it as the translation. The same restart translates the calls only
+// an older policy traps, such as `open`. A call the policy traps with no
+// translation is answered instead of raising SIGSYS: the set-id calls by
+// proot's rule, the rest with EPERM or ENOSYS, as trapped-calls.h lists it. A
+// SIGSYS for a call that list does not name comes from a filter of the
+// program's own, such as Chromium's sandbox, and is delivered to the program.
 //
 // The shim traces the whole tree it starts, following forks and clones. A
 // process that execs a proot is detached at that exec, since proot traces its
@@ -363,6 +366,24 @@ static int translate_legacy(pid_t pid, struct user_regs_struct *r) {
     }
 }
 
+// Rewrites a legacy call that only an older policy traps, such as open below
+// API 30. Used only for a call that has been trapped, so where the policy
+// allows it the call runs as the program made it. Returns 1 if the registers
+// were changed.
+static int translate_old_policy(struct user_regs_struct *r) {
+    unsigned long a0 = r->rdi, a1 = r->rsi, a2 = r->rdx;
+
+    switch ((long)r->orig_rax) {
+    case SYS_open:  // open(path, flags, mode)
+        r->orig_rax = SYS_openat;
+        r->rdi = (unsigned long)AT_FDCWD; r->rsi = a0; r->rdx = a1; r->r10 = a2;
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
 // Points a path-taking syscall at the stand-in /etc, if that is what it asked
 // for. Runs after the legacy rewrite, so it sees the final syscall number.
 static int redirect_paths(pid_t pid, struct user_regs_struct *r) {
@@ -408,6 +429,14 @@ struct tracee {
     // the child, which gets a copy, at its first stop.
     int fork_saved;
     unsigned long long fork_args[6];
+    // A call restarted as its translation at its SIGSYS: the call as asked,
+    // and the address after its syscall instruction. A signal handler can run
+    // before the restart, so what its exit stop needs is kept at the restarted
+    // call's own entry stop, known by that address and the translated number.
+    int restarted;
+    unsigned long long restart_rip;
+    long restart_nr;
+    struct user_regs_struct restart_asked;
 };
 
 // Every process and thread traced, in a table that doubles when it fills.
@@ -612,20 +641,55 @@ static int trapped_result(int nr, const struct user_regs_struct *r, long *result
     }
 }
 
+// Keeps what the exit stop of a rewritten call needs: the descriptor dup2
+// reports, and fork's argument registers.
+static void rewritten(struct tracee *t, const struct user_regs_struct *asked,
+                      const struct user_regs_struct *regs) {
+    if ((long)asked->orig_rax == NR_dup2 && (long)regs->orig_rax == SYS_fcntl)
+        t->dup2_result = (long)asked->rdi;
+    if ((long)asked->orig_rax == NR_fork) save_fork_args(t, asked);
+    if (verbose)
+        fprintf(stderr, "[shim] %ld -> %ld\n", (long)asked->orig_rax, (long)regs->orig_rax);
+}
+
+// At the SIGSYS for call nr, rewrites the call to its translation and backs the
+// tracee up to its syscall instruction, so the translation runs in its place.
+// This is how a translation reaches a call on kernels below 4.8, where seccomp
+// runs before the syscall-entry stop, and how a call only an older policy traps
+// is translated at all. Returns 1 if the call was restarted.
+// ponytail: one pending restart per tracee; a signal handler that itself makes
+// a trapped fork or dup2 before the restart replaces it, and the interrupted
+// call loses its exit fix-up. A stack of them if a program does that.
+static int restart_translated(struct tracee *t, int nr, struct user_regs_struct *regs) {
+    regs->orig_rax = (unsigned long)nr;
+    struct user_regs_struct asked = *regs;
+    if (!translate_legacy(t->pid, regs) && !translate_old_policy(regs)) return 0;
+    redirect_paths(t->pid, regs);
+    t->restarted = 1;
+    t->restart_rip = regs->rip;
+    t->restart_nr = (long)regs->orig_rax;
+    t->restart_asked = asked;
+    regs->rax = regs->orig_rax;
+    // No restart of the kernel's own for this call, whatever signal comes next.
+    regs->orig_rax = (unsigned long)-1;
+    regs->rip -= 2;  // the length of the syscall instruction
+    return ptrace(PTRACE_SETREGS, t->pid, 0, regs) == 0;
+}
+
 // One syscall stop: the entry rewrites the call, the exit fixes up its result.
 static void syscall_stop(struct tracee *t) {
     struct user_regs_struct regs;
     if (t->in_entry) {
         if (get_regs(t->pid, &regs) == 0) {
+            if (t->restarted && regs.rip == t->restart_rip &&
+                (long)regs.orig_rax == t->restart_nr) {
+                t->restarted = 0;
+                rewritten(t, &t->restart_asked, &regs);
+            }
             struct user_regs_struct asked = regs;
             if (translate(t->pid, &regs)) {
                 ptrace(PTRACE_SETREGS, t->pid, 0, &regs);
-                if ((long)asked.orig_rax == NR_dup2 && (long)regs.orig_rax == SYS_fcntl)
-                    t->dup2_result = (long)asked.rdi;
-                if ((long)asked.orig_rax == NR_fork) save_fork_args(t, &asked);
-                if (verbose)
-                    fprintf(stderr, "[shim] %ld -> %ld\n",
-                            (long)asked.orig_rax, (long)regs.orig_rax);
+                rewritten(t, &asked, &regs);
             }
         }
     } else if (t->fork_saved) {
@@ -741,7 +805,10 @@ int main(int argc, char **argv) {
                 // A thread other than the leader that execs takes the leader's
                 // pid; msg is its former one, which reports no exit.
                 if ((pid_t)msg != pid) drop((pid_t)msg);
-                if (t) { t->in_entry = 0; t->dup2_result = -1; t->fork_saved = 0; }
+                if (t) {
+                    t->in_entry = 0; t->dup2_result = -1; t->fork_saved = 0;
+                    t->restarted = 0;
+                }
                 // proot has not forked yet, so it starts untraced and can trace
                 // its own children.
                 if (execd_proot(pid)) {
@@ -762,13 +829,21 @@ int main(int argc, char **argv) {
             siginfo_t si;
             struct user_regs_struct regs;
             long result;
-            if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_code == SYS_SECCOMP &&
-                si.si_arch == AUDIT_ARCH_X86_64 && get_regs(pid, &regs) == 0 &&
-                trapped_result(si.si_syscall, &regs, &result)) {
+            if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) != 0 || si.si_code != SYS_SECCOMP ||
+                si.si_arch != AUDIT_ARCH_X86_64 || get_regs(pid, &regs) != 0) {
+                deliver = signo;
+            } else if (t && si.si_errno == 0 && restart_translated(t, si.si_syscall, &regs)) {
+                // si_errno is the filter's SECCOMP_RET_DATA: 0 for Android's
+                // policy, a handler's number for a sandbox such as Chromium's,
+                // whose trap is its own to handle.
+                // The restarted call's entry stop comes next.
+            } else if (get_regs(pid, &regs) == 0 &&
+                       trapped_result(si.si_syscall, &regs, &result)) {
                 regs.rax = (unsigned long)result;
                 ptrace(PTRACE_SETREGS, pid, 0, &regs);
                 if (verbose) fprintf(stderr, "[shim] %d -> %ld\n", si.si_syscall, result);
             } else {
+                if (verbose) fprintf(stderr, "[shim] SIGSYS for %d delivered\n", si.si_syscall);
                 deliver = signo;
             }
         } else if (signo != SIGSTOP) {
