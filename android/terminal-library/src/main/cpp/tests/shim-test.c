@@ -2,9 +2,9 @@
  * The tracee side of run.sh: each mode checks one thing the shim does and exits
  * 0 when it holds.
  *
- *   trap MODE ARGS...   traps getpgrp, fork, uselib, acct, epoll_create, open and
- *                       the set-id calls the way Android's policy does, then runs
- *                       MODE ARGS... in this program
+ *   trap MODE ARGS...   traps getpgrp, fork, uselib, acct, epoll_create, open,
+ *                       poll and the set-id calls the way Android's policy
+ *                       does, then runs MODE ARGS... in this program
  *   parity N            a raw getpgrp and a raised SIGTRAP, then N execs of
  *                       itself that do the same
  *   thread-exec N       N execs, each from a thread other than the leader, each
@@ -26,6 +26,11 @@
  *                       and child
  *   fork-interrupted N  as fork, in one process, with a timer signal
  *                       interrupting some of them
+ *   scratch-interrupted N
+ *                       N raw polls with no wait, which give 0 or EINTR, and N
+ *                       raw opens of /etc/shim-probe, which SYSCALL_SHIM_ETC
+ *                       maps to a file, with a timer signal interrupting some
+ *                       of them
  *   exec PATH ARGS...   execs PATH with ARGS... as its argv
  *   anything else       prints this process's TracerPid
  */
@@ -61,7 +66,7 @@ static int install(struct sock_filter *f, unsigned short n) {
 static const int legacy[] = {
 	SYS_getpgrp, SYS_fork, SYS_uselib, SYS_acct, SYS_setuid, SYS_setgid,
 	SYS_setreuid, SYS_setregid, SYS_setfsuid, SYS_setfsgid, SYS_setresgid, SYS_setgroups,
-	SYS_epoll_create, SYS_open,
+	SYS_epoll_create, SYS_open, SYS_poll,
 };
 #define NLEGACY (sizeof legacy / sizeof *legacy)
 
@@ -262,6 +267,26 @@ static int forks_interrupted(int n) {
 	return forks_in_turn(n);
 }
 
+/* A signal between a trapped call's SIGSYS and its restart pushes its frame over
+ * the room below the stack pointer where the translation writes poll's timeout
+ * and the mapped path. Each round arms the timer a little later, from 10 to
+ * 400 us, so that some signal lands in that gap. */
+static int scratch_interrupted(int n) {
+	struct sigaction sa = { .sa_handler = on_alarm, .sa_flags = SA_RESTART };
+	if (sigaction(SIGALRM, &sa, 0)) return 1;
+	for (int i = 0; i < n; i++) {
+		struct itimerval once = { { 0, 0 }, { 0, 10 * (i % 40 + 1) } };
+		if (setitimer(ITIMER_REAL, &once, 0)) return 1;
+		long ret = syscall(SYS_poll, 0, 0, 0);
+		/* A signal pending as the call runs gives EINTR, even with no wait. */
+		if (ret != 0 && errno != EINTR) { fprintf(stderr, "poll: %s\n", strerror(errno)); return 1; }
+		long fd = syscall(SYS_open, "/etc/shim-probe", O_RDONLY | O_CLOEXEC, 0);
+		if (fd < 0) { fprintf(stderr, "open: %s\n", strerror(errno)); return 1; }
+		close((int)fd);
+	}
+	return 0;
+}
+
 static int tracer_pid(void) {
 	char line[256];
 	FILE *f = fopen("/proc/self/status", "r");
@@ -289,6 +314,7 @@ int main(int argc, char **argv) {
 	if (argc > 2 && !strcmp(argv[1], "thread-exec")) return thread_exec(atoi(argv[2]));
 	if (argc > 2 && !strcmp(argv[1], "fork")) return forks(atoi(argv[2]));
 	if (argc > 2 && !strcmp(argv[1], "fork-interrupted")) return forks_interrupted(atoi(argv[2]));
+	if (argc > 2 && !strcmp(argv[1], "scratch-interrupted")) return scratch_interrupted(atoi(argv[2]));
 	if (argc > 1 && !strcmp(argv[1], "enosys")) return enosys();
 	if (argc > 1 && !strcmp(argv[1], "own-trap")) return own_trap();
 	if (argc > 1 && !strcmp(argv[1], "epoll")) return epoll();

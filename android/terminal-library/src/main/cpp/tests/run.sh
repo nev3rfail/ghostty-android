@@ -43,6 +43,9 @@ ok "a program's own SIGSYS, for a call the policy allows and one it traps" 'shim
 # Enough forks for some child to stop before its parent's fork event.
 ok "fork keeps the argument registers in parent and child" 'shim trap fork 3000'
 ok "an interrupted fork restarts as fork" 'shim trap fork-interrupted 2000'
+mkdir "$W/etc" && : > "$W/etc/shim-probe"
+ok "a signal before a restarted call keeps its timeout and path" \
+  'SYSCALL_SHIM_ETC=$W/etc shim trap scratch-interrupted 5000'
 
 ok "libproot.so runs untraced" \
   '[ "$(shim exec "$W/libproot.so" libproot.so)" = 0 ]'

@@ -19,10 +19,10 @@
 // with no translation is answered instead of raising SIGSYS: the set-id calls
 // by proot's rule, the rest with EPERM or ENOSYS, as trapped-calls.h lists it,
 // and the newer calls only an older policy traps, such as `membarrier`, with
-// ENOSYS; those two, the restart and the older policy's answer, only for a
-// trap with no filter data, as Android's policy sets none. A SIGSYS for any
-// other call comes from a filter of the program's own, such as Chromium's
-// sandbox, and is delivered to the program.
+// ENOSYS; those two, the restart and the older policy's answer, only below
+// API 30 and only for a trap with no filter data, as Android's policy sets
+// none. A SIGSYS for any other call comes from a filter of the program's own,
+// such as Chromium's sandbox, and is delivered to the program.
 //
 // The shim traces the whole tree it starts, following forks and clones. A
 // process that execs a proot is detached at that exec, since proot traces its
@@ -47,6 +47,9 @@
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#ifdef __ANDROID__
+#include <android/api-level.h>
+#endif
 
 #if !defined(__x86_64__)
 
@@ -103,6 +106,10 @@ int main(int argc, char **argv) {
 #endif
 
 static int verbose;
+// The device's policy is one from below API 30, which traps more calls: open,
+// readlink and the calls newer than its kernels. Off Android, as in the host
+// tests, every policy is taken as that one.
+static int old_policy;
 
 // Where materialised arguments are written: far enough below the stack pointer
 // to clear the red zone and any pending frame. Paths and timespecs get separate
@@ -418,6 +425,28 @@ static int translate(pid_t pid, struct user_regs_struct *r) {
     return changed;
 }
 
+// The translation of a trapped call: the legacy rewrite or the older policy's,
+// then the /etc redirect. Returns 1 if the call has a translation.
+static int translate_trapped(pid_t pid, struct user_regs_struct *r) {
+    if (!translate_legacy(pid, r) && !translate_old_policy(r)) return 0;
+    redirect_paths(pid, r);
+    return 1;
+}
+
+// Copies the call a makes, its number and argument registers, into r.
+static void set_call(struct user_regs_struct *r, const struct user_regs_struct *a) {
+    r->orig_rax = a->orig_rax;
+    r->rdi = a->rdi; r->rsi = a->rsi; r->rdx = a->rdx;
+    r->r10 = a->r10; r->r8 = a->r8; r->r9 = a->r9;
+}
+
+// Whether a and b make the same call from the same place.
+static int same_call(const struct user_regs_struct *a, const struct user_regs_struct *b) {
+    return a->rip == b->rip && a->orig_rax == b->orig_rax &&
+           a->rdi == b->rdi && a->rsi == b->rsi && a->rdx == b->rdx &&
+           a->r10 == b->r10 && a->r8 == b->r8 && a->r9 == b->r9;
+}
+
 struct tracee {
     pid_t pid;  // 0 for a free slot
     // The next syscall stop is an entry.
@@ -437,14 +466,19 @@ struct tracee {
     // the child, which gets a copy, at its first stop.
     int fork_saved;
     unsigned long long fork_args[6];
+    // The registers at the last entry stop, before any rewrite. From Linux 4.8
+    // a trap comes after the entry stop has rewritten the call, and a restart
+    // translates the call as asked, not that rewrite.
+    struct user_regs_struct entry_asked;
     // A call restarted as its translation at its SIGSYS: the call as asked,
-    // and the address after its syscall instruction. A signal handler can run
-    // before the restart, so what its exit stop needs is kept at the restarted
-    // call's own entry stop, known by that address and the translated number.
+    // and the translation, as the restarted call's entry stop shows it. A
+    // signal handler can run before the restart, and its frame covers the
+    // room below the stack pointer that the translation writes, so the
+    // translation is made again at that entry stop, as the call runs, and what
+    // its exit stop needs is kept there.
     int restarted;
-    unsigned long long restart_rip;
-    long restart_nr;
     struct user_regs_struct restart_asked;
+    struct user_regs_struct restart_call;
 };
 
 // Every process and thread traced, in a table that doubles when it fills.
@@ -690,12 +724,13 @@ static void rewritten(struct tracee *t, const struct user_regs_struct *asked,
 static int restart_translated(struct tracee *t, int nr, struct user_regs_struct *regs) {
     regs->orig_rax = (unsigned long)nr;
     struct user_regs_struct asked = *regs;
-    if (!translate_legacy(t->pid, regs) && !translate_old_policy(regs)) return 0;
-    redirect_paths(t->pid, regs);
+    if (t->entry_asked.rip == regs->rip && (long)t->entry_asked.orig_rax == nr)
+        set_call(&asked, &t->entry_asked);
+    *regs = asked;
+    if (!translate_trapped(t->pid, regs)) return 0;
     t->restarted = 1;
-    t->restart_rip = regs->rip;
-    t->restart_nr = (long)regs->orig_rax;
     t->restart_asked = asked;
+    t->restart_call = *regs;
     regs->rax = regs->orig_rax;
     // No restart of the kernel's own for this call, whatever signal comes next.
     regs->orig_rax = (unsigned long)-1;
@@ -708,13 +743,18 @@ static void syscall_stop(struct tracee *t) {
     struct user_regs_struct regs;
     if (t->in_entry) {
         if (get_regs(t->pid, &regs) == 0) {
-            if (t->restarted && regs.rip == t->restart_rip &&
-                (long)regs.orig_rax == t->restart_nr) {
-                t->restarted = 0;
-                rewritten(t, &t->restart_asked, &regs);
-            }
+            t->entry_asked = regs;
             struct user_regs_struct asked = regs;
-            if (translate(t->pid, &regs)) {
+            int changed;
+            if (t->restarted && same_call(&regs, &t->restart_call)) {
+                t->restarted = 0;
+                set_call(&regs, &t->restart_asked);
+                asked = regs;
+                changed = translate_trapped(t->pid, &regs);
+            } else {
+                changed = translate(t->pid, &regs);
+            }
+            if (changed) {
                 ptrace(PTRACE_SETREGS, t->pid, 0, &regs);
                 rewritten(t, &asked, &regs);
             }
@@ -754,6 +794,11 @@ int main(int argc, char **argv) {
         return 2;
     }
     verbose = getenv("SYSCALL_SHIM_VERBOSE") != NULL;
+#ifdef __ANDROID__
+    old_policy = android_get_device_api_level() < 30;
+#else
+    old_policy = 1;
+#endif
     etc_dir = getenv("SYSCALL_SHIM_ETC");
     if (etc_dir) {
         etc_dir_len = strlen(etc_dir);
@@ -859,7 +904,8 @@ int main(int argc, char **argv) {
             if (ptrace(PTRACE_GETSIGINFO, pid, 0, &si) != 0 || si.si_code != SYS_SECCOMP ||
                 si.si_arch != AUDIT_ARCH_X86_64 || get_regs(pid, &regs) != 0) {
                 deliver = signo;
-            } else if (t && si.si_errno == 0 && restart_translated(t, si.si_syscall, &regs)) {
+            } else if (t && old_policy && si.si_errno == 0 &&
+                       restart_translated(t, si.si_syscall, &regs)) {
                 // si_errno is the filter's SECCOMP_RET_DATA: 0 for Android's
                 // policy, a handler's number for a sandbox such as Chromium's,
                 // whose trap is its own to handle.
@@ -869,7 +915,7 @@ int main(int argc, char **argv) {
                 regs.rax = (unsigned long)result;
                 ptrace(PTRACE_SETREGS, pid, 0, &regs);
                 if (verbose) fprintf(stderr, "[shim] %d -> %ld\n", si.si_syscall, result);
-            } else if (si.si_errno == 0 && old_policy_error(si.si_syscall)) {
+            } else if (old_policy && si.si_errno == 0 && old_policy_error(si.si_syscall)) {
                 regs.rax = (unsigned long)-old_policy_error(si.si_syscall);
                 ptrace(PTRACE_SETREGS, pid, 0, &regs);
                 if (verbose)
